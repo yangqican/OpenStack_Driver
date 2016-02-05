@@ -1298,7 +1298,7 @@ class HuaweiV3FCDriver(Huawei18000FCDriver):
         data['volume_backend_name'] = backend_name or self.__class__.__name__
         data['storage_protocol'] = 'FC'
         data['driver_version'] = self.VERSION
-        data['verdor_name'] = 'Huawei'
+        data['vendor_name'] = 'Huawei'
         return data
 
     @utils.synchronized('huawei', external=True)
@@ -1611,5 +1611,5 @@ class HuaweiTV2FCDriver(Huawei18000FCDriver):
         data['volume_backend_name'] = backend_name or self.__class__.__name__
         data['storage_protocol'] = 'FC'
         data['driver_version'] = self.VERSION
-        data['verdor_name'] = 'Huawei'
+        data['vendor_name'] = 'Huawei'
         return data
