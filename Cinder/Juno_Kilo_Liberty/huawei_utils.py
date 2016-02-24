@@ -263,8 +263,8 @@ def get_qos_by_volume_type(volume_type):
         LOG.error(msg)
         raise exception.InvalidInput(reason=msg)
 
-        lower_limit_list = ['MINIOPS', 'LATENCY', 'MINBANDWITH']
-        upper_limit_list = ['MAXIOPS', 'MAXBANDWITH']
+        lower_limit_list = ['MINIOPS', 'LATENCY', 'MINBANDWIDTH']
+        upper_limit_list = ['MAXIOPS', 'MAXBANDWIDTH']
         for upper_limit in upper_limit_list:
             for lower_limit in lower_limit_list:
                 if upper_limit in qos and lower_limit in qos:
