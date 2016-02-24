@@ -53,6 +53,11 @@ class HuaweiHyperMetro(object):
             remote_pool = self.rmt_client.find_all_pools()
             pool = self.rmt_client.find_pool_info(config_pool,
                                                   remote_pool)
+            if not pool:
+                err_msg = (_("Remote pool cannot be got."))
+                LOG.error(err_msg)
+                raise exception.VolumeBackendAPIException(data=err_msg)
+
             # Create remote lun
             lun_param['PARENTID'] = pool['ID']
             remotelun_info = self.rmt_client.create_volume(lun_param)

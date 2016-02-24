@@ -65,5 +65,6 @@ HUAWEI_VALID_KEYS = ['maxIOPS', 'minIOPS', 'minBandWidth',
                      'maxBandWidth', 'latency', 'IOType']
 QOS_KEYS = ['MAXIOPS', 'MINIOPS', 'MINBANDWidth',
             'MAXBANDWidth', 'LATENCY', 'IOTYPE']
+EXTRA_QOS_KEYS = ['MAXIOPS', 'MINIOPS', 'MINBANDWIDTH', 'MAXBANDWIDTH']
 MAX_LUN_NUM_IN_QOS = 64
 HYPERMETRO_CLASS = "cinder.volume.drivers.huawei.hypermetro.HuaweiHyperMetro"

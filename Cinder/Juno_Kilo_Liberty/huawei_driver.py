@@ -492,6 +492,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                           snapshot_id, tgt_lun_id)
 
         return {'ID': lun_info['ID'],
+                'provider_location': lun_info['ID'],
                 'lun_info': lun_info}
 
     def create_cloned_volume(self, volume, src_vref):

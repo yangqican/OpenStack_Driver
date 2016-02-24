@@ -252,6 +252,22 @@ class TseriesClient(object):
             volume_size = '%sG' % volume['size']
         parameters = self._parse_volume_type(volume)
         volume_id = self._create_volume(volume_name, volume_size, parameters)
+        count = 0
+        max_wait_time = 300
+        while self._is_lun_normal(volume_id) is False:
+            if count >= max_wait_time:
+                err_msg = (_('LUN %(volume_id)s is still not normal after'
+                             ' %(max_wait_time)s seconds wait.')
+                           % {'volume_id': volume_id,
+                              'max_wait_time': max_wait_time})
+                LOG.error(err_msg)
+                raise exception.VolumeBackendAPIException(data=err_msg)
+            else:
+                LOG.debug('LUN %s is not normal, sleep 1s to wait.',
+                          volume_id)
+                time.sleep(1)
+                count = count + 1
+
         return volume_id
 
     def _name_translate(self, name):
@@ -1151,21 +1167,6 @@ class TseriesClient(object):
                         new_hostlun_id = int(maping[4]) + 1
 
         if not hostlun_id:
-            count = 0
-            max_wait_time = 5
-            while self._is_lun_normal(volume_id) is False:
-                if count >= max_wait_time:
-                    err_msg = (_('LUN %(volume_id)s is still not normal after'
-                                 ' %(max_wait_time)s seconds wait.')
-                               % {'volume_id': volume_id,
-                                  'max_wait_time': max_wait_time})
-                    LOG.error(err_msg)
-                    raise exception.VolumeBackendAPIException(data=err_msg)
-                else:
-                    LOG.debug('LUN %s is not normal, sleep 1s to wait.',
-                              volume_id)
-                    time.sleep(1)
-                    count = count + 1
             cli_cmd = ('addhostmap -host %(host_id)s -devlun %(lunid)s '
                        '-hostlun %(hostlunid)s'
                        % {'host_id': host_id,

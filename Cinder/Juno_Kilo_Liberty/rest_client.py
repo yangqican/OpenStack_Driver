@@ -1538,24 +1538,39 @@ class RestClient(object):
         """"Find available QoS on the array."""
         qos_id = None
         lun_list = []
+        extra_qos = [i for i in constants.EXTRA_QOS_KEYS if i not in qos]
         result = self.get_qos()
 
         if 'data' in result:
-            for item in result['data']:
+            for items in result['data']:
                 qos_flag = 0
-                for key in qos:
-                    if key not in item:
+                extra_flag = 0
+                if ('LATENCY' not in qos and items['LATENCY'] != '0'):
+                        extra_flag = extra_flag + 1
+                for item in items:
+                    if item in extra_qos:
+                        extra_flag = extra_flag + 1
                         break
-                    elif qos[key] != item[key]:
+                for key in qos:
+                    if key not in items:
+                        break
+                    elif qos[key] != items[key]:
                         break
                     qos_flag = qos_flag + 1
-                lun_num = len(item['LUNLIST'].split(","))
+                lun_num = len(items['LUNLIST'].split(","))
+                qos_name = items['NAME']
+                qos_status = items['RUNNINGSTATUS']
                 # We use this QoS only if the LUNs in it is less than 64,
+                # and must created by openstack also not contain filesystem,
                 # else we cannot add LUN to this QoS any more.
                 if (qos_flag == len(qos)
-                        and lun_num < constants.MAX_LUN_NUM_IN_QOS):
-                    qos_id = item['ID']
-                    lun_list = item['LUNLIST']
+                        and extra_flag == 0
+                        and lun_num < constants.MAX_LUN_NUM_IN_QOS
+                        and qos_name.startswith(constants.QOS_NAME_PREFIX)
+                        and qos_status == constants.STATUS_QOS_ACTIVE
+                        and items['FSLIST'] == '[""]'):
+                    qos_id = items['ID']
+                    lun_list = items['LUNLIST']
                     break
 
         return (qos_id, lun_list)

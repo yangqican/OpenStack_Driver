@@ -217,33 +217,62 @@ def get_conf_host_os_type(host_ip, conf):
 
 
 def get_qos_by_volume_type(volume_type):
-    qos = {}
-    qos_specs_id = volume_type.get('qos_specs_id')
-
     # We prefer the qos_specs association
     # and override any existing extra-specs settings
     # if present.
-    if qos_specs_id is not None:
-        kvs = qos_specs.get_qos_specs(context.get_admin_context(),
-                                      qos_specs_id)['specs']
-    else:
-        return qos
+    if not volume_type:
+        return {}
 
+    qos_specs_id = volume_type.get('qos_specs_id')
+    if not qos_specs_id:
+        return {}
+
+    qos = {}
+    io_type_flag = None
+    ctxt = context.get_admin_context()
+    kvs = qos_specs.get_qos_specs(ctxt, qos_specs_id)['specs']
     LOG.info(_LI('The QoS sepcs is: %s.'), kvs)
-    for key, value in kvs.items():
-        if key in constants.HUAWEI_VALID_KEYS:
-            if (key.upper() != 'IOTYPE') and (int(value) <= 0):
-                err_msg = (_('Qos config is wrong. %(key)s'
-                             ' must be set greater than 0.')
-                           % {'key': key})
-                LOG.error(err_msg)
-                raise exception.VolumeBackendAPIException(data=err_msg)
-            elif (key.upper() == 'IOTYPE') and (value not in ['0', '1', '2']):
-                raise exception.InvalidInput(
-                    reason=(_('Illegal value specified for IOTYPE: '
-                              'set to either 0, 1, or 2.')))
-            else:
-                qos[key.upper()] = value
+    for k, v in kvs.items():
+        if k not in constants.HUAWEI_VALID_KEYS:
+            continue
+        if k.upper() != 'IOTYPE' and int(v) <= 0:
+            msg = _('QoS config is wrong. %s must > 0.') % k
+            LOG.error(msg)
+            raise exception.InvalidInput(reason=msg)
+        if k.upper() == 'IOTYPE' and v not in ['0', '1', '2']:
+            msg = _('Illegal value specified for IOTYPE: 0, 1, or 2.')
+            LOG.error(msg)
+            raise exception.InvalidInput(reason=msg)
+        elif k.upper() == 'IOTYPE':
+            io_type_flag = 1
+            qos[k.upper()] = v
+        else:
+            qos[k.upper()] = v
+
+    if not io_type_flag:
+        msg = (_('QoS policy must specify for IOTYPE: 0, 1, or 2,'
+                 'QoS policy: %(qos_policy)s '), {'qos_policy': qos})
+        LOG.error(msg)
+        raise exception.InvalidInput(reason=msg)
+
+    # QoS policy must specify for IOTYPE and another qos_specs.
+    if len(qos) < 2:
+        msg = (_('QoS policy must specify for IOTYPE and another '
+                 'qos_specs, QoS policy: %(qos_policy)s '),
+               {'qos_policy': qos})
+        LOG.error(msg)
+        raise exception.InvalidInput(reason=msg)
+
+        lower_limit_list = ['MINIOPS', 'LATENCY', 'MINBANDWITH']
+        upper_limit_list = ['MAXIOPS', 'MAXBANDWITH']
+        for upper_limit in upper_limit_list:
+            for lower_limit in lower_limit_list:
+                if upper_limit in qos and lower_limit in qos:
+                    msg = (_('QoS policy upper_limit and lower_limite '
+                             'conflict, QoS policy: %(qos_policy)s '),
+                           {'qos_policy': qos})
+                    LOG.error(msg)
+                    raise exception.InvalidInput(reason=msg)
 
     return qos
 
