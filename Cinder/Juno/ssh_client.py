@@ -19,27 +19,20 @@ Common classes for Huawei OceanStor T series storage arrays.
 The common classes provide the drivers command line operation using SSH.
 """
 
-try:
-    from oslo_log import log as logging
-    from oslo_utils import excutils
-except ImportError:
-    from cinder.openstack.common import log as logging
-    from oslo.utils import excutils
-
 import base64
 import re
-import six
 import socket
 import threading
 import time
 from xml.etree import ElementTree as ET
 
+from oslo.utils import excutils
+import six
+
 from cinder import context
 from cinder import exception
-from cinder.i18n import _
-from cinder.i18n import _LE
-from cinder.i18n import _LI
-from cinder.i18n import _LW
+from cinder.i18n import _, _LE, _LI, _LW
+from cinder.openstack.common import log as logging
 from cinder import ssh_utils
 from cinder import utils
 from cinder.volume.drivers.huawei import constants
@@ -47,6 +40,13 @@ from cinder.volume.drivers.huawei import huawei_utils
 from cinder.volume import utils as volume_utils
 from cinder.volume import volume_types
 
+DJ_crypt_available = True
+try:
+    import kmc.kmc
+    K = kmc.kmc.API()
+    kmc_domain = kmc.kmc.KMC_DOMAIN.DEFAULT
+except ImportError:
+    DJ_crypt_available = False
 
 LOG = logging.getLogger(__name__)
 
@@ -55,6 +55,7 @@ HOST_NAME_PREFIX = 'Host_'
 VOL_AND_SNAP_NAME_PREFIX = 'OpenStack_'
 HOST_PORT_PREFIX = 'HostPort_'
 HOST_LUN_ERR_MSG = 'host LUN is mapped or does not exist'
+contrs = ['A', 'B']
 
 
 def ssh_read(user, channel, cmd, timeout):
@@ -116,7 +117,7 @@ class TseriesClient(object):
         self.hostgroup_id = None
         self.ssh_pool = None
         self.lock_ip = threading.Lock()
-        self.luncopy_list = []  # to store LUNCopy name
+        self.luncopy_list = []  # To store LUNCopy name
 
     def do_setup(self, context):
         """Check config file."""
@@ -129,30 +130,125 @@ class TseriesClient(object):
         self.luncopy_list = self._get_all_luncopy_name()
         self.hostgroup_id = self._get_hostgroup_id(HOST_GROUP_NAME)
 
+    def parse_xml_file(self, xml_file_path):
+        """Get root of xml file."""
+        try:
+            tree = ET.parse(xml_file_path)
+            root = tree.getroot()
+            return root
+        except IOError as err:
+            LOG.error(_LE('parse_xml_file: %s.'), err)
+            raise
+
+    def get_xml_item(self, xml_root, item):
+        """Get the given item details.
+
+        :param xml_root: The root of xml tree
+        :param item: The tag need to get
+        :return: A dict contains all the config info of the given item.
+        """
+        items_list = []
+        items = xml_root.findall(item)
+        for item in items:
+            tmp_dict = {'text': None, 'attrib': {}}
+            if item.text:
+                tmp_dict['text'] = item.text.strip()
+            for key, val in item.attrib.items():
+                if val:
+                    item.attrib[key] = val.strip()
+            tmp_dict['attrib'] = item.attrib
+            items_list.append(tmp_dict)
+        return items_list
+
+    def get_conf_host_os_type(self, host_ip):
+        """Get host OS type from xml config file.
+
+        :param host_ip: The IP of Nova host
+        :param config: xml config file
+        :return: host OS type
+        """
+        os_conf = {}
+        root = self.parse_xml_file(self.xml_file_path)
+        hosts_list = self.get_xml_item(root, 'Host')
+        for host in hosts_list:
+            os = host['attrib']['OSType'].strip()
+            ips = [ip.strip() for ip in host['attrib']['HostIP'].split(',')]
+            os_conf[os] = ips
+        host_os = None
+        for k, v in os_conf.items():
+            if host_ip in v:
+                host_os = constants.OS_TYPE.get(k, None)
+        if not host_os:
+            host_os = constants.OS_TYPE['Linux']  # Default OS type.
+
+        LOG.debug('_get_host_os_type: Host %(ip)s OS type is %(os)s.',
+                  {'ip': host_ip, 'os': host_os})
+
+        return host_os
+
+    def is_xml_item_exist(self, xml_root, item, attrib_key=None):
+        """Check if the given item exits in xml config file.
+
+        :param xml_root: The root of xml tree
+        :param item: The xml tag to check
+        :param attrib_key: The xml attrib to check
+        :return: True of False
+        """
+        items_list = self.get_xml_item(xml_root, item)
+        if attrib_key:
+            for tmp_dict in items_list:
+                if tmp_dict['attrib'].get(attrib_key, None):
+                    return True
+        else:
+            if items_list and items_list[0]['text']:
+                return True
+        return False
+
+    def is_xml_item_valid(self, xml_root, item, valid_list, attrib_key=None):
+        """Check if the given item is valid in xml config file.
+
+        :param xml_root: The root of xml tree
+        :param item: The xml tag to check
+        :param valid_list: The valid item value
+        :param attrib_key: The xml attrib to check
+        :return: True of False
+        """
+        items_list = self.get_xml_item(xml_root, item)
+        if attrib_key:
+            for tmp_dict in items_list:
+                value = tmp_dict['attrib'].get(attrib_key, None)
+                if value not in valid_list:
+                    return False
+        else:
+            value = items_list[0]['text']
+            if value not in valid_list:
+                return False
+
+        return True
+
     def _check_conf_file(self):
         """Check config file, make sure essential items are set."""
-        root = huawei_utils.parse_xml_file(self.xml_file_path)
+        root = self.parse_xml_file(self.xml_file_path)
         check_list = ['Storage/ControllerIP0', 'Storage/ControllerIP1',
                       'Storage/UserName', 'Storage/UserPassword']
         for item in check_list:
-            if not huawei_utils.is_xml_item_exist(root, item):
+            if not self.is_xml_item_exist(root, item):
                 err_msg = (_('_check_conf_file: Config file invalid. '
                              '%s must be set.') % item)
                 LOG.error(err_msg)
                 raise exception.InvalidInput(reason=err_msg)
 
         # Make sure storage pool is set.
-        if not huawei_utils.is_xml_item_exist(root, 'LUN/StoragePool', 'Name'):
+        if not self.is_xml_item_exist(root, 'LUN/StoragePool', 'Name'):
             err_msg = _('_check_conf_file: Config file invalid. '
                         'StoragePool must be set.')
             LOG.error(err_msg)
             raise exception.InvalidInput(reason=err_msg)
 
         # If setting os type, make sure it valid.
-        if huawei_utils.is_xml_item_exist(root, 'Host', 'OSType'):
+        if self.is_xml_item_exist(root, 'Host', 'OSType'):
             os_list = constants.OS_TYPE.keys()
-            if not huawei_utils.is_xml_item_valid(root, 'Host', os_list,
-                                                  'OSType'):
+            if not self.is_xml_item_valid(root, 'Host', os_list, 'OSType'):
                 err_msg = (_('_check_conf_file: Config file invalid. '
                              'Host OSType is invalid.\n'
                              'The valid values are: %(os_list)s')
@@ -177,9 +273,15 @@ class TseriesClient(object):
             node_text = node.text.strip()
             # Prefix !$$$ means encoded already.
             if node_text.find('!$$$') > -1:
-                logininfo[key] = base64.b64decode(node_text[4:])
+                logininfo_key = base64.b64decode(node_text[4:])
+                if DJ_crypt_available and key == "UserPassword":
+                    logininfo_key = K.decrypt(kmc_domain, logininfo_key)
+                logininfo[key] = logininfo_key
             else:
-                logininfo[key] = node_text
+                if DJ_crypt_available and key == "UserPassword":
+                    logininfo[key] = K.decrypt(kmc_domain, node_text)
+                else:
+                    logininfo[key] = node_text
                 node.text = '!$$$' + base64.b64encode(node_text)
                 need_encode = True
         if need_encode:
@@ -192,7 +294,7 @@ class TseriesClient(object):
         return logininfo
 
     def _change_file_mode(self, filepath):
-        utils.execute('chmod', '640', filepath, run_as_root=True)
+        utils.execute('chmod', '600', filepath, run_as_root=True)
 
     def _get_lun_distribution_info(self, luns):
         """Get LUN distribution information.
@@ -238,6 +340,52 @@ class TseriesClient(object):
                 extended_dict[vol_name] = add_ids
         return extended_dict
 
+    def check_volume_exist_on_array(self, volume):
+        """Check whether the volume exists on the array.
+
+        If the volume exists on the array, return the LUN ID.
+        If not exists, return None.
+        """
+        lun_id = volume.get('provider_location')
+        if not lun_id:
+            LOG.warning(_LW("No LUN ID recorded for volume %s, find it by "
+                            "Name now."), volume['id'])
+            volume_name = self._name_translate(volume['name'])
+            lun_id = self._get_lun_id(volume_name)
+            if not lun_id:
+                # We won't raise a error here, let's the caller decide whether
+                # to raise or not.
+                LOG.warning(_LW("Volume %s not exists on the array."),
+                            volume['id'])
+                return None
+
+        metadata = huawei_utils.get_volume_metadata(volume)
+        lun_wwn = metadata.get('lun_wwn') if metadata else None
+        if not lun_wwn:
+            LOG.warning(_LW("No LUN WWN recorded for volume %s"), volume['id'])
+
+        if not self.check_lun_exist(lun_id, lun_wwn):
+            return None
+        return lun_id
+
+    def _get_lun_wwn(self, lun_id):
+        lun_wwn = None
+        cli_cmd = ('showlun -lun %s' % lun_id)
+        out = self._execute_cli(cli_cmd)
+        if re.search('LUN Information', out):
+            try:
+                line = out.split('\r\n')[6]
+                lun_wwn = line.split()[3]
+            except Exception:
+                err_msg = (_('CLI out is not normal. CLI out: %s') % out)
+                LOG.error(err_msg)
+                raise exception.VolumeBackendAPIException(data=err_msg)
+
+            LOG.debug('Got LUN WWN %(lun_wwn)s for LUN %(lun_id)s'
+                      % {'lun_wwn': lun_wwn,
+                         'lun_id': lun_id})
+        return lun_wwn
+
     @utils.synchronized('huawei', external=False)
     def create_volume(self, volume):
         """Create a new volume."""
@@ -251,24 +399,32 @@ class TseriesClient(object):
         else:
             volume_size = '%sG' % volume['size']
         parameters = self._parse_volume_type(volume)
-        volume_id = self._create_volume(volume_name, volume_size, parameters)
+        lun_id = self._create_volume(volume_name, volume_size, parameters)
         count = 0
         max_wait_time = 300
-        while self._is_lun_normal(volume_id) is False:
+        while self._is_lun_normal(lun_id) is False:
             if count >= max_wait_time:
-                err_msg = (_('LUN %(volume_id)s is still not normal after'
+                err_msg = (_('LUN %(lun_id)s is still not normal after'
                              ' %(max_wait_time)s seconds wait.')
-                           % {'volume_id': volume_id,
+                           % {'lun_id': lun_id,
                               'max_wait_time': max_wait_time})
                 LOG.error(err_msg)
                 raise exception.VolumeBackendAPIException(data=err_msg)
             else:
                 LOG.debug('LUN %s is not normal, sleep 1s to wait.',
-                          volume_id)
+                          lun_id)
                 time.sleep(1)
                 count = count + 1
 
-        return volume_id
+        lun_wwn = self._get_lun_wwn(lun_id)
+
+        model_update = {}
+        metadata = huawei_utils.get_volume_metadata(volume)
+        metadata.update({'lun_wwn': lun_wwn})
+        model_update['metadata'] = metadata
+        model_update['provider_location'] = lun_id
+
+        return model_update
 
     def _name_translate(self, name):
         """Form new names for volume and snapshot.
@@ -432,7 +588,6 @@ class TseriesClient(object):
                                      cli_cmd, out)
         if ctr:
             self._update_lun_distribution(ctr)
-
         return self._get_lun_id(name)
 
     def _calculate_lun_ctr(self):
@@ -482,7 +637,7 @@ class TseriesClient(object):
                        'PrefetchTimes': '0',
                        'StoragePool': []}
 
-        root = huawei_utils.parse_xml_file(self.xml_file_path)
+        root = self.parse_xml_file(self.xml_file_path)
 
         stripunitsize = root.findtext('LUN/StripUnitSize')
         if stripunitsize:
@@ -510,6 +665,12 @@ class TseriesClient(object):
 
         return conf_params
 
+    def create_channel(self, client, width, height):
+        """Invoke an interactive shell session on server."""
+        channel = client.invoke_shell()
+        channel.resize_pty(width, height)
+        return channel
+
     @utils.synchronized('huawei-cli', external=False)
     def _execute_cli(self, cmd):
         """Build SSH connection and execute CLI commands.
@@ -519,8 +680,8 @@ class TseriesClient(object):
 
         """
 
-        LOG.debug('CLI command: %s' % cmd)
-        old_cmd = cmd
+        if (' -pwd ' not in cmd) and (' -opwd ' not in cmd):
+            LOG.debug('CLI command: %s' % cmd)
         connect_times = 1
         ip0 = self.login_info['ControllerIP0']
         ip1 = self.login_info['ControllerIP1']
@@ -567,14 +728,14 @@ class TseriesClient(object):
                 # An SSH client owns one "chan".
                 if not getattr(ssh_client, 'chan', None):
                     setattr(ssh_client, 'chan',
-                            utils.create_channel(ssh_client, 600, 800))
+                            self.create_channel(ssh_client, 600, 800))
 
                 busyRetryTime = 5
                 while True:
                     if 0 == ssh_client.chan.send(cmd + '\n'):
                         ssh_client.chan.close()
                         setattr(ssh_client, 'chan',
-                                utils.create_channel(ssh_client, 600, 800))
+                                self.create_channel(ssh_client, 600, 800))
                         ssh_client.chan.send(cmd + '\n')
                     out = ssh_read(user, ssh_client.chan, cmd, 200)
                     if out.find('(y/n)') > -1 or out.find('y or n') > -1:
@@ -589,15 +750,15 @@ class TseriesClient(object):
                                      ' %(cmd)s, CLI out: %(out)s')
                                    % {'cmd': cmd,
                                       'out': out})
+                        if (' -pwd ' in cmd) or (' -opwd ' in cmd):
+                            err_msg = (_('Login failed when running command:'
+                                         'CLI out: %(out)s')
+                                       % {'out': out})
                         LOG.error(err_msg)
                         raise exception.VolumeBackendAPIException(data=err_msg)
                     else:
                         # Put SSH client back into SSH pool.
-                        if (old_cmd == 'showrg') or (old_cmd == 'showpool'):
-                            ssh_client.chan.close()
-                            self.ssh_pool.remove(ssh_client)
-                        else:
-                            self.ssh_pool.put(ssh_client)
+                        self.ssh_pool.put(ssh_client)
                         return out
 
             except Exception as err:
@@ -619,33 +780,31 @@ class TseriesClient(object):
 
     @utils.synchronized('huawei', external=False)
     def delete_volume(self, volume):
-        volume_name = self._name_translate(volume['name'])
-
-        LOG.debug('delete_volume: volume name: %s' % volume_name)
-
-        self.update_login_info()
-        volume_id = volume.get('provider_location', None)
-        if volume_id is None or not self._check_volume_created(volume_id):
-            err_msg = (_('delete_volume: Volume %(name)s does not exist.')
-                       % {'name': volume['name']})
-            LOG.warning(err_msg)
+        lun_id = self.check_volume_exist_on_array(volume)
+        if not lun_id:
+            LOG.warning(_LW("Volume %s not exists on the array."),
+                        volume['id'])
             return
 
-        map_info = self._get_host_map_info_by_lunid(volume_id)
+        volume_name = self._name_translate(volume['name'])
+        LOG.debug('delete_volume: volume name: %s' % volume_name)
+        self.update_login_info()
+
+        map_info = self._get_host_map_info_by_lunid(lun_id)
         if map_info and len(map_info) is 1:
             self._delete_map(map_info[0][0])
 
-        added_vol_ids = self._get_extended_lun_member(volume_id)
+        added_vol_ids = self._get_extended_lun_member(lun_id)
         if added_vol_ids:
-            self._del_lun_from_extended_lun(volume_id, added_vol_ids)
-        self._delete_volume(volume_id)
+            self._del_lun_from_extended_lun(lun_id, added_vol_ids)
+        self._delete_volume(lun_id)
 
-    def _check_volume_created(self, volume_id):
-        if volume_id is None:
+    def check_lun_exist(self, lun_id, lun_wwn=None):
+        current_wwn = self._get_lun_wwn(lun_id)
+        if lun_wwn and lun_wwn != current_wwn:
             return False
-        cli_cmd = 'showlun -lun %s' % volume_id
-        out = self._execute_cli(cli_cmd)
-        return (True if re.search('LUN Information', out) else False)
+
+        return (True if current_wwn else False)
 
     def _get_extended_lun_member(self, lun_id):
         cli_cmd = 'showextlunmember -ext %s' % lun_id
@@ -687,6 +846,11 @@ class TseriesClient(object):
         """Run CLI command to delete volume."""
         cli_cmd = 'dellun -force -lun %s' % volumeid
         out = self._execute_cli(cli_cmd)
+
+        if re.search('The LUN does not exist', out):
+            LOG.warning(_LW("LUN %s does not exist on array when we"
+                        "deleting it."), volumeid)
+            return
 
         self._assert_cli_operate_out('_delete_volume',
                                      ('Failed to delete volume. volume id: %s'
@@ -730,7 +894,15 @@ class TseriesClient(object):
         tgt_vol_id = self._create_volume(volume_name, volume_size, parameters)
         self._copy_volume(snapshot_id, tgt_vol_id)
 
-        return tgt_vol_id
+        lun_wwn = self._get_lun_wwn(tgt_vol_id)
+
+        model_update = {}
+        metadata = huawei_utils.get_volume_metadata(volume)
+        metadata.update({'lun_wwn': lun_wwn})
+        model_update['metadata'] = metadata
+        model_update['provider_location'] = tgt_vol_id
+
+        return model_update
 
     def _copy_volume(self, src_vol_id, tgt_vol_id):
         """Copy a volume or snapshot to target volume."""
@@ -819,6 +991,11 @@ class TseriesClient(object):
                                      cli_cmd, out)
 
     def create_cloned_volume(self, tgt_volume, src_volume):
+        src_vol_id = self.check_volume_exist_on_array(src_volume)
+        if not src_vol_id:
+            msg = _("Volume %s not exists on the array.") % src_volume['id']
+            raise exception.VolumeBackendAPIException(data=msg)
+
         src_vol_name = self._name_translate(src_volume['name'])
         tgt_vol_name = self._name_translate(tgt_volume['name'])
 
@@ -827,13 +1004,6 @@ class TseriesClient(object):
                                            'tgt': tgt_vol_name})
 
         self.update_login_info()
-        src_vol_id = src_volume.get('provider_location', None)
-        if not src_vol_id:
-            src_vol_id = self._get_lun_id(src_vol_name)
-            if src_vol_id is None:
-                LOG.error(_LE('Source volume %(name)s does not exist.'),
-                          {'name': src_vol_name})
-                raise exception.VolumeNotFound(volume_id=src_vol_name)
 
         # Create a target volume.
         if int(tgt_volume['size']) == 0:
@@ -844,7 +1014,15 @@ class TseriesClient(object):
         tgt_vol_id = self._create_volume(tgt_vol_name, tgt_vol_size, params)
         self._copy_volume(src_vol_id, tgt_vol_id)
 
-        return tgt_vol_id
+        lun_wwn = self._get_lun_wwn(tgt_vol_id)
+
+        model_update = {}
+        metadata = huawei_utils.get_volume_metadata(tgt_volume)
+        metadata.update({'lun_wwn': lun_wwn})
+        model_update['metadata'] = metadata
+        model_update['provider_location'] = tgt_vol_id
+
+        return model_update
 
     def _get_all_luns_info(self):
         cli_cmd = 'showlun'
@@ -880,6 +1058,15 @@ class TseriesClient(object):
                 err_msg = (_('CLI out is not normal. CLI out: %s') % out)
                 LOG.error(err_msg)
                 raise exception.VolumeBackendAPIException(data=err_msg)
+        elif re.search('The object does not exist', out):
+            err_msg = _('LUN %s does not exist on array.') % lun_id
+            LOG.error(err_msg)
+            raise exception.VolumeBackendAPIException(data=err_msg)
+        else:
+            err_msg = _('Unexpected cli out: %s') % out
+            LOG.error(err_msg)
+            raise exception.VolumeBackendAPIException(data=err_msg)
+
         return status
 
     def _wait_for_lun_status(self, lun_id, expected_status):
@@ -899,13 +1086,13 @@ class TseriesClient(object):
             time.sleep(2)
 
     def extend_volume(self, volume, new_size):
-        lun_id = volume.get('provider_location', None)
+        lun_id = self.check_volume_exist_on_array(volume)
+        if not lun_id:
+            msg = _("Volume %s not exists on the array.") % volume['id']
+            raise exception.VolumeBackendAPIException(data=msg)
+
         extended_vol_name = self._name_translate(volume['name'])
-        if lun_id is None:
-            err_msg = (_('extend_volume: volume %s does not exist.')
-                       % extended_vol_name)
-            LOG.error(err_msg)
-            raise exception.VolumeNotFound(volume_id=extended_vol_name)
+
         added_vol_ids = self._get_extended_lun_member(lun_id)
         added_vol_name = ('ext_' + extended_vol_name.split('_')[1] + '_' +
                           six.text_type(len(added_vol_ids)))
@@ -1121,9 +1308,9 @@ class TseriesClient(object):
                      or re.search('The name exists already', cliout))
         self._assert_cli_out(condition, func, msg, cmd, cliout)
 
-    def _is_lun_normal(self, volume_id):
+    def _is_lun_normal(self, lun_id):
         """Check whether the LUN is normal."""
-        cli_cmd = ('showlun -lun %s' % volume_id)
+        cli_cmd = ('showlun -lun %s' % lun_id)
         out = self._execute_cli(cli_cmd)
         if re.search('LUN Information', out):
             try:
@@ -1135,20 +1322,17 @@ class TseriesClient(object):
                 LOG.error(err_msg)
                 raise exception.VolumeBackendAPIException(data=err_msg)
 
-            LOG.debug('LUN: %(volume_id)s, current status: %(status)s'
-                      % {'volume_id': volume_id,
+            LOG.debug('LUN: %(lun_id)s, current status: %(status)s'
+                      % {'lun_id': lun_id,
                          'status': status})
             if (status == 'Normal') or (status == 'Formatting'):
                 return True
 
         return False
 
-    def map_volume(self, host_id, volume_id):
+    def map_volume(self, host_id, lun_id):
         """Map a volume to a host."""
         # Map a LUN to a host if not mapped.
-        if not self._check_volume_created(volume_id):
-            LOG.error(_LE('map_volume: Volume %s was not found.'), volume_id)
-            raise exception.VolumeNotFound(volume_id=volume_id)
 
         hostlun_id = None
         map_info = self.get_host_map_info(host_id)
@@ -1157,7 +1341,7 @@ class TseriesClient(object):
         new_hostlunid_found = False
         if map_info:
             for maping in map_info:
-                if maping[2] == volume_id:
+                if maping[2] == lun_id:
                     hostlun_id = maping[4]
                     break
                 elif not new_hostlunid_found:
@@ -1170,7 +1354,7 @@ class TseriesClient(object):
             cli_cmd = ('addhostmap -host %(host_id)s -devlun %(lunid)s '
                        '-hostlun %(hostlunid)s'
                        % {'host_id': host_id,
-                          'lunid': volume_id,
+                          'lunid': lun_id,
                           'hostlunid': new_hostlun_id})
             out = self._execute_cli(cli_cmd)
             # Check whether the hostlunid has already been assigned.
@@ -1180,13 +1364,13 @@ class TseriesClient(object):
                 cli_cmd = ('addhostmap -host %(host_id)s -devlun %(lunid)s '
                            '-hostlun %(hostlunid)s'
                            % {'host_id': host_id,
-                              'lunid': volume_id,
+                              'lunid': lun_id,
                               'hostlunid': new_hostlun_id})
                 out = self._execute_cli(cli_cmd)
                 condition = re.search(HOST_LUN_ERR_MSG, out)
 
             msg = ('Failed to map LUN %s to host %s. host LUN ID: %s'
-                   % (volume_id, host_id, new_hostlun_id))
+                   % (lun_id, host_id, new_hostlun_id))
             self._assert_cli_operate_out('map_volume', msg, cli_cmd, out)
 
             hostlun_id = new_hostlun_id
@@ -1224,8 +1408,7 @@ class TseriesClient(object):
         host_name = HOST_NAME_PREFIX + host_name
         host_id = self._get_host_id(host_name, self.hostgroup_id)
         if host_id is None:
-            os_type = huawei_utils.get_conf_host_os_type(host_ip,
-                                                         self.configuration)
+            os_type = self.get_conf_host_os_type(host_ip)
             try:
                 self._create_host(host_name, self.hostgroup_id, os_type)
                 host_id = self._get_host_id(host_name, self.hostgroup_id)
@@ -1385,35 +1568,34 @@ class TseriesClient(object):
                                      'LUN %s' % lun_id,
                                      cli_cmd, out)
 
-    def remove_map(self, volume_id, host_name, initiator=None):
-        """Remove host map."""
+    def get_host_id(self, host_name, initiator=None):
         # Check the old host name to support the upgrade from grizzly to
         # higher versions.
         host_id = None
-        if self.hostgroup_id is None:
-            self.hostgroup_id = self._get_hostgroup_id(HOST_GROUP_NAME)
-            if self.hostgroup_id is None:
-                return None
         if initiator:
-            old_host_name = HOST_NAME_PREFIX + six.text_type(hash(initiator))
+            old_host_name = HOST_NAME_PREFIX + str(hash(initiator))
             host_id = self._get_host_id(old_host_name, self.hostgroup_id)
         if host_id is None:
             if host_name and (len(host_name) > 26):
-                host_name = six.text_type(hash(host_name))
+                host_name = str(hash(host_name))
             host_name = HOST_NAME_PREFIX + host_name
             host_id = self._get_host_id(host_name, self.hostgroup_id)
             if host_id is None:
-                LOG.debug('remove_map: Host %s does not exist.', host_name)
+                LOG.warning(_LW('remove_map: Host %s does not exist.'),
+                            host_name)
                 return None
 
-        if not self._check_volume_created(volume_id):
-            LOG.error(_LE('remove_map: Volume %s does not exist.'), volume_id)
+        return host_id
 
+    def remove_map(self, lun_id, host_id):
+        """Remove host map."""
+        if host_id is None:
+            return
         map_id = None
         map_info = self.get_host_map_info(host_id)
         if map_info:
             for maping in map_info:
-                if maping[2] == volume_id:
+                if maping[2] == lun_id:
                     map_id = maping[0]
                     break
         if map_id is not None:
@@ -1421,16 +1603,15 @@ class TseriesClient(object):
                 self._delete_map(map_id)
             except Exception:
                 map_info = self.get_host_map_info(host_id)
-                if map_info and filter(lambda x: x[2] == volume_id, map_info):
+                if map_info and filter(lambda x: x[2] == lun_id, map_info):
                     err_msg = (_('remove_map: Failed to delete host map to '
-                                 'volume %s.') % volume_id)
+                                 'volume %s.') % lun_id)
                     LOG.error(err_msg)
                     raise exception.VolumeBackendAPIException(data=err_msg)
         else:
-            LOG.warning(_LW('remove_map: No map between host %(host)s and '
-                            'volume %(volume)s.'), {'host': host_name,
-                                                    'volume': volume_id})
-        return host_id
+            LOG.warning(_LW('remove_map: No map between host %(host_id)s and '
+                            'volume %(volume)s.') % {'host_id': host_id,
+                                                     'volume': lun_id})
 
     def _delete_map(self, mapid, attempts=5):
         """Run CLI command to remove map."""
@@ -1461,6 +1642,37 @@ class TseriesClient(object):
                                   'out': out})
                     LOG.error(err_msg)
                     raise exception.VolumeBackendAPIException(data=err_msg)
+
+    def find_chap_info(self, iscsi_conf, initiator_name):
+        """Find CHAP info from xml."""
+        chapinfo = None
+        default_chapinfo = None
+        chap = []
+
+        for ini in iscsi_conf.get('Initiator', []):
+            if ini.get('Name') == initiator_name:
+                chapinfo = ini.get('CHAPinfo')
+                break
+            else:
+                default_chapinfo = ini.get('CHAPinfo')
+
+        if default_chapinfo:
+            chap = default_chapinfo.split(';')
+            default_chapinfo = []
+            if len(chap) > 1:
+                default_chapinfo.append(chap[0])
+                default_chapinfo.append(chap[1])
+
+            return default_chapinfo
+
+        if chapinfo:
+            chap = chapinfo.split(';')
+            chapinfo = []
+            if len(chap) > 1:
+                chapinfo.append(chap[0])
+                chapinfo.append(chap[1])
+
+        return chapinfo
 
     def delete_hostport(self, portid, attempts=5):
         """Run CLI command to delete host port."""
@@ -1645,6 +1857,74 @@ class TseriesClient(object):
         LOG.warning(_LW('disk (%s) status is unavailable'), disk_name)
         return False
 
+    def _get_iscsi_tgt_port_info_ultrapath(self, port_ip_list):
+        """Get iSCSI Port information of storage device."""
+        port_info_list = []
+        cli_cmd = 'showiscsiip'
+        out = self._execute_cli(cli_cmd)
+        if re.search('iSCSI IP Information', out):
+            try:
+                for line in out.split('\r\n')[6:-2]:
+                    tmp_line = line.split()
+                    if len(tmp_line) < 4:
+                        continue
+                    if tmp_line[3] in port_ip_list:
+                        port_info_list.append(tmp_line)
+            except Exception:
+                err_msg = (_('CLI out is not normal. CLI out: %s') % out)
+                LOG.error(err_msg)
+                raise exception.VolumeBackendAPIException(data=err_msg)
+
+        if port_info_list:
+            return port_info_list
+
+        err_msg = _('All target IPs are not available,'
+                    'all target IPs  is not configured in array')
+        LOG.error(err_msg)
+        raise exception.VolumeBackendAPIException(data=err_msg)
+
+    def get_tgt_iqn_ultrapath(self, port_ip_list):
+
+        LOG.debug('get_tgt_iqn_ultrapath: iSCSI list is %s.' % port_ip_list)
+
+        cli_cmd = 'showiscsitgtname'
+        out = self._execute_cli(cli_cmd)
+
+        self._assert_cli_out(re.search('ISCSI Name', out),
+                             'get_tgt_iqn',
+                             'Failed to get iSCSI target iqn.',
+                             cli_cmd, out)
+
+        lines = out.split('\r\n')
+        try:
+            index = lines[4].index('iqn')
+            iqn_prefix = lines[4][index:].strip()
+        except Exception:
+            err_msg = (_('CLI out is not normal. CLI out: %s') % out)
+            LOG.error(err_msg)
+            raise exception.VolumeBackendAPIException(data=err_msg)
+        # Here we make sure port_info won't be None.
+        ret_info = []
+        port_info_list = self._get_iscsi_tgt_port_info_ultrapath(port_ip_list)
+        for port_info in port_info_list:
+            ctr = ('0' if port_info[0] == 'A' else '1')
+            interface = '0' + port_info[1]
+            port = '0' + port_info[2][1:]
+            iqn_suffix = ctr + '02' + interface + port
+            # iqn_suffix should not start with 0
+            while(True):
+                if iqn_suffix.startswith('0'):
+                    iqn_suffix = iqn_suffix[1:]
+                else:
+                    break
+
+            iqn = iqn_prefix + ':' + iqn_suffix + ':' + port_info[3]
+
+            LOG.debug('_get_tgt_iqn: iSCSI target iqn is %s.' % iqn)
+            ret_info.append((iqn, port_info[3], port_info[0]))
+
+        return ret_info
+
     def get_tgt_iqn(self, port_ip):
         """Run CLI command to get target iSCSI iqn.
 
@@ -1708,7 +1988,8 @@ class TseriesClient(object):
         LOG.error(err_msg)
         raise exception.VolumeBackendAPIException(data=err_msg)
 
-    def add_iscsi_port_to_host(self, hostid, connector, multipathtype=0):
+    def add_iscsi_port_to_host(self, hostid, connector,
+                               chapinfo=None, multipathtype=0,):
         """Add an iSCSI port to the given host.
 
         First, add an initiator if needed, the initiator is equivalent to
@@ -1729,6 +2010,17 @@ class TseriesClient(object):
                 if hostport[2] == initiator:
                     portadded = True
                     break
+
+        if chapinfo:
+            if self._chapuser_added_to_array(initiator, chapinfo[0]):
+                self.change_chapuser_password(chapinfo)
+            else:
+                self.add_chapuser_to_array(chapinfo)
+            if not self._chapuser_added_to_initiator(initiator, chapinfo[0]):
+                self.add_chapuser_to_ini(chapinfo, initiator)
+
+            self.active_chap(initiator)
+
         if not portadded:
             cli_cmd = ('addhostport -host %(id)s -type 5 '
                        '-info %(info)s -n %(name)s -mtype %(multype)s'
@@ -1758,6 +2050,136 @@ class TseriesClient(object):
         self._assert_cli_operate_out('_add_iscsi_host_port',
                                      'Failed to add initiator %s' % ininame,
                                      cli_cmd, out)
+
+    def _chapuser_added_to_array(self, initiator, chapuser_name):
+        """Check whether the chapuser is already added to array."""
+        cli_cmd = ('showchapuser')
+        out = self._execute_cli(cli_cmd)
+        if re.search('Chap User Information', out):
+            try:
+                for line in out.split('\r\n')[4:-2]:
+                    tmp_line = line.split()
+                    if chapuser_name in tmp_line:
+                        return True
+            except Exception:
+                err_msg = (_('CLI out is not normal. CLI out: %s') % out)
+                LOG.error(err_msg)
+                raise exception.VolumeBackendAPIException(data=err_msg)
+        return False
+
+    def _chapuser_added_to_initiator(self, initiator, chapuser_name):
+        """Check whether the chapuser is already added to initiator."""
+        cli_cmd = ('showchapuser -ini %(name)s' % {'name': initiator})
+        out = self._execute_cli(cli_cmd)
+        if re.search('Chap User Information', out):
+            try:
+                for line in out.split('\r\n')[4:-2]:
+                    tmp_line = line.split()
+                    if chapuser_name in tmp_line:
+                        return True
+            except Exception:
+                err_msg = (_('CLI out is not normal. CLI out: %s') % out)
+                LOG.error(err_msg)
+                raise exception.VolumeBackendAPIException(data=err_msg)
+        return False
+
+    def is_initiator_used_chap(self, initiator):
+        """Check whether the initiator is used chap."""
+        cli_cmd = 'showiscsiini -ini %(name)s' % {'name': initiator}
+        out = self._execute_cli(cli_cmd)
+        if re.search('Initiator Information', out):
+            try:
+                for line in out.split('\r\n'):
+                    tmp_line = line.split()
+                    if 'Enabled' in tmp_line:
+                        return True
+            except Exception:
+                err_msg = (_('CLI out is not normal. CLI out: %s') % out)
+                LOG.error(err_msg)
+                raise exception.VolumeBackendAPIException(data=err_msg)
+        return False
+
+    def change_chapuser_password(self, chapinfo):
+        # change chapuser password.
+        LOG.info(_LI('Change chappassword, chapuser is: %s .'),
+                 chapinfo[0])
+        cli_cmd = ('chgchapuserpwd -n %(chapuser)s '
+                   '-npwd %(new_password)s '
+                   '-opwd %(old_password)s' %
+                   {'chapuser': chapinfo[0],
+                    'new_password': chapinfo[1],
+                    'old_password': chapinfo[1]})
+        out = self._execute_cli(cli_cmd)
+
+        if 'Invalid user name or password' in out:
+            LOG.error(_LE('Failed to change chappassword, chapuser is: %s .'),
+                      chapinfo[0])
+        msg = ('Failed to change chappassword.')
+        self._assert_cli_operate_out('change chappassword.',
+                                     msg, None, out)
+
+    def add_chapuser_to_array(self, chapinfo):
+        # add chapuser.
+        LOG.info(_LI('Add chappassword, chapuser is: %s .'),
+                 chapinfo[0])
+        cli_cmd = ('addchapuser -n %(username)s -pwd %(password)s' %
+                   {'username': chapinfo[0],
+                    'password': chapinfo[1]})
+        out = self._execute_cli(cli_cmd)
+
+        if 'The CHAP user exists already' in out:
+            LOG.warning(_LW('The CHAP user %s exists already.'),
+                        chapinfo[0])
+        else:
+            msg = ('Failed to add chapinfo.')
+            self._assert_cli_operate_out('add chapuser',
+                                         msg, None, out)
+
+    def add_chapuser_to_ini(self, chapinfo, initiator):
+        # add chapuser to initiator.
+        cli_cmd = ('addchapusertoini -chapuser %(username)s '
+                   '-ini %(initiator)s'
+                   % {'username': chapinfo[0],
+                      'initiator': initiator})
+        out = self._execute_cli(cli_cmd)
+
+        msg = ('Failed to add chapuser into initiator.')
+        self._assert_cli_operate_out('add chapuser into initiator',
+                                     msg, cli_cmd, out)
+
+    def active_chap(self, initiator):
+        cli_cmd = ('chginichapstatus -ini %(initiator)s '
+                   '-st %(chap_status)s'
+                   % {'initiator': initiator,
+                      'chap_status': 1})
+        out = self._execute_cli(cli_cmd)
+
+        msg = ('Failed to change chap status.')
+        self._assert_cli_operate_out('change chap status.',
+                                     msg, cli_cmd, out)
+
+    def _remove_chap(self, initiator, chapinfo):
+        "change chapstatus to unopen for initiator"
+        cli_cmd = ('chginichapstatus -ini %(initiator)s '
+                   '-st %(chap_status)s' %
+                   {'initiator': initiator,
+                    'chap_status': 0})
+        out = self._execute_cli(cli_cmd)
+
+        msg = ('Failed to change chap status.')
+        self._assert_cli_operate_out('change chap status.',
+                                     msg, cli_cmd, out)
+
+        # remove chapuser from initiator.
+        cli_cmd = ('rmchapuserfromini -chapuser %(username)s '
+                   '-ini %(initiator)s' %
+                   {'username': chapinfo[0],
+                    'initiator': initiator})
+        out = self._execute_cli(cli_cmd)
+
+        msg = ('Failed to remove chapuser from initiator.')
+        self._assert_cli_operate_out('remove chapuser from initiator',
+                                     msg, cli_cmd, out)
 
     def get_connected_free_wwns(self):
         """Get free connected FC port WWNs.
@@ -1816,3 +2238,83 @@ class TseriesClient(object):
             tmp_details[key] = val
         port_details.append(tmp_details)
         return port_details
+
+    def get_all_fc_ports_from_array(self):
+        # Get all host ports
+        cli_cmd = ('showport -logic 1')
+        out = self._execute_cli(cli_cmd)
+        fc_ports = []
+        if re.search('Port Information', out):
+            test_list = out.split('\r\n')
+            for line in test_list[6:-2]:
+                tmp_line = line.split()
+                for contr in contrs:
+                    if len(tmp_line) < 10:
+                        continue
+                    if (tmp_line[6] == 'FC' and tmp_line[0] == contr and
+                       tmp_line[9] == 'Up'):
+                        cmd = ('showport -c %(contr)s -e %(enclu)s -mt 3 '
+                               '-module %(module)s -p %(pr_id)s -pt 1'
+                               % {'contr': contr,
+                                  'enclu': tmp_line[1],
+                                  'module': tmp_line[4],
+                                  'pr_id': tmp_line[5]})
+                        res = self._execute_cli(cmd)
+                        if re.search('Port Information', res):
+                            tmp_list = res.split('\r\n')
+                            for li in tmp_list[6:-2]:
+                                tmp_li = li.split()
+                                if tmp_li[0] == 'WWN(MAC)':
+                                    fc_ports.append(tmp_li[2])
+                                    break
+        return fc_ports
+
+    def get_fc_ports_from_contr(self, contr):
+        # Get all host ports per controller.
+        cli_cmd = ('showport -logic 1')
+        out = self._execute_cli(cli_cmd)
+        fc_ports = []
+        if re.search('Port Information', out):
+            test_list = out.split('\r\n')
+            for line in test_list[6:-2]:
+                tmp_line = line.split()
+                if len(tmp_line) < 10:
+                    continue
+                if (tmp_line[6] == 'FC' and tmp_line[0] == contr and
+                   tmp_line[9] == 'Up'):
+                    cmd = ('showport -c %(contr)s -e %(enclu)s -mt 3 -module '
+                           '%(module)s -p %(pr_id)s -pt 1'
+                           % {'contr': contr,
+                              'enclu': tmp_line[1],
+                              'module': tmp_line[4],
+                              'pr_id': tmp_line[5]})
+                    res = self._execute_cli(cmd)
+                    if re.search('Port Information', res):
+                        tmp_list = res.split('\r\n')
+                        for li in tmp_list[6:-2]:
+                            tmp_li = li.split()
+                            if tmp_li[0] == 'WWN(MAC)':
+                                fc_ports.append(tmp_li[2])
+                                break
+        return fc_ports
+
+    def ensure_fc_initiator_added(self, initiator_name, hostid):
+        # There is no command to query used host_ini.
+        self._add_fc_initiator_to_array(initiator_name)
+        # Just add, no need to check whether have been added.
+        self._add_fc_port_to_host(hostid, initiator_name)
+
+    def _add_fc_initiator_to_array(self, initiator_name):
+        cli_cmd = ('addofflinewwpn -t 1 -wwpn %s' % initiator_name)
+        self._execute_cli(cli_cmd)
+
+    def _add_fc_port_to_host(self, hostid, wwn, multipathtype=0):
+        """Add a FC port to host."""
+        portname = HOST_PORT_PREFIX + wwn
+        cli_cmd = ('addhostport -host %(id)s -type 1 '
+                   '-wwn %(wwn)s -n %(name)s -mtype %(multype)s'
+                   % {'id': hostid,
+                      'wwn': wwn,
+                      'name': portname,
+                      'multype': multipathtype})
+        self._execute_cli(cli_cmd)

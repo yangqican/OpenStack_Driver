@@ -237,6 +237,8 @@ class V3StorageConnection(driver.HuaweiBase):
         for pool_type in ('Thin', 'Thick'):
             pool_name_list = root.findtext(('Filesystem/%s_StoragePool'
                                             % pool_type))
+            if pool_name_list is None:
+                continue
             pool_name_list = pool_name_list.split(";")
             for pool_name in pool_name_list:
                 pool_name = pool_name.strip().strip('\n')

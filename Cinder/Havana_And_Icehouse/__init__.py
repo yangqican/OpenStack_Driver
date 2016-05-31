@@ -19,7 +19,7 @@ Provide a unified driver class for users.
 The product type and the protocol should be specified in config file before.
 """
 
-"""software version: 1.01.008"""
+"""software version: 1.01.007"""
 
 import six
 
