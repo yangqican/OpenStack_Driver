@@ -2232,6 +2232,7 @@ class TseriesClient(object):
             # Cut-point of multipal details, usually is "-------".
             if len(line) == 1:
                 port_details.append(tmp_details)
+		tmp_details = {}
                 continue
             key = ''.join(line[0].strip().split())
             val = line[1].strip()
