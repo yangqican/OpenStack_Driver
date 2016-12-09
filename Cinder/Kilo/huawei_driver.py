@@ -13,11 +13,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
 import json
 import re
 import uuid
 
 from oslo_config import cfg
+from oslo_config import types
 from oslo_log import log as logging
 from oslo_utils import excutils
 from oslo_utils import units
@@ -46,28 +48,27 @@ huawei_opts = [
     cfg.StrOpt('cinder_huawei_conf_file',
                default='/etc/cinder/cinder_huawei_conf.xml',
                help='The configuration file for the Cinder Huawei driver.'),
-    cfg.StrOpt('hypermetro_devices',
-               default=None,
-               help='The remote device hypermetro will use.'),
-    cfg.StrOpt('metro_san_user',
-               default=None,
-               help='The remote metro device san user.'),
-    cfg.StrOpt('metro_san_password',
-               default=None,
-               help='The remote metro device san password.'),
-    cfg.StrOpt('metro_domain_name',
-               default=None,
-               help='The remote metro device domain name.'),
-    cfg.StrOpt('metro_san_address',
-               default=None,
-               help='The remote metro device request url.'),
-    cfg.StrOpt('metro_storage_pools',
-               default=None,
-               help='The remote metro device pool names.'),
+    cfg.MultiOpt('hypermetro_device',
+                 item_type=types.Dict(),
+                 secret=True,
+                 help='Multi opt of dictionaries to represent a hypermetro '
+                      'target device. This option may be specified multiple '
+                      'times in a single config section to specify multiple '
+                      'hypermetro target devices. Each entry takes the '
+                      'standard dict config form: hypermetro_device = '
+                      'key1:value1,key2:value2...'),
+    cfg.BoolOpt('libvirt_iscsi_use_ultrapath',
+                default=False,
+                help='use ultrapath connection of the iSCSI volume'),
 ]
 
 CONF = cfg.CONF
 CONF.register_opts(huawei_opts)
+
+snap_attrs = ('id', 'volume_id', 'volume', 'provider_location', 'metadata')
+vol_attrs = ('id', 'lun_type', 'provider_location', 'metadata')
+Snapshot = collections.namedtuple('Snapshot', snap_attrs)
+Volume = collections.namedtuple('Volume', vol_attrs)
 
 
 class HuaweiBaseDriver(driver.VolumeDriver):
@@ -83,8 +84,25 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
         self.configuration.append_config_values(huawei_opts)
         self.huawei_conf = huawei_conf.HuaweiConf(self.configuration)
+        self.support_func = None
         self.metro_flag = False
         self.replica = None
+        self.use_ultrapath = self.configuration.safe_get(
+            'libvirt_iscsi_use_ultrapath')
+
+    def check_func_support(self, obj_name):
+        try:
+            self.client._get_object_count(obj_name)
+            return True
+        except Exception:
+            return False
+
+    def check_rmt_func_support(self, obj_name):
+        try:
+            self.rmt_client._get_object_count(obj_name)
+            return True
+        except Exception:
+            return False
 
     def get_local_and_remote_dev_conf(self):
         self.loc_dev_conf = self.huawei_conf.get_local_device()
@@ -118,22 +136,15 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                                              **client_conf)
         self.client.login()
 
-        # init remote client
-        metro_san_address = self.configuration.safe_get("metro_san_address")
-        metro_san_user = self.configuration.safe_get("metro_san_user")
-        metro_san_password = self.configuration.safe_get("metro_san_password")
-        if metro_san_address and metro_san_user and metro_san_password:
-            metro_san_address = metro_san_address.split(";")
+        # init hypermetro remote client
+        hypermetro_devs = self.huawei_conf.get_hypermetro_devices()
+        hypermetro_client_conf = hypermetro_devs[0] if hypermetro_devs else {}
+        if hypermetro_client_conf:
             self.rmt_client = rest_client.RestClient(self.configuration,
-                                                     metro_san_address,
-                                                     metro_san_user,
-                                                     metro_san_password)
-
+                                                     **hypermetro_client_conf)
             self.rmt_client.login()
             self.metro_flag = True
-        else:
-            self.metro_flag = False
-            LOG.warning(_LW("Not config remote device in cinder.conf"))
+
         # init replication manager
         if replica_client_conf:
             self.replica_client = rest_client.RestClient(self.configuration,
@@ -150,7 +161,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         """Get volume status and reload huawei config file."""
         self.huawei_conf.update_config_value()
         stats = self.client.update_volume_stats()
-        stats = self.update_hypermetro_capability(stats)
+        stats = self.update_support_capability(stats)
 
         if self.replica:
             stats = self.replica.update_replica_capability(stats)
@@ -160,21 +171,38 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
         return stats
 
-    def update_hypermetro_capability(self, stats):
-        if self.metro_flag:
-            version = self.client.find_array_version()
-            rmt_version = self.rmt_client.find_array_version()
-            if (version >= constants.ARRAY_VERSION
-                    and rmt_version >= constants.ARRAY_VERSION):
-                for pool in stats['pools']:
-                    pool['hypermetro'] = True
-                    pool['consistencygroup_support'] = True
+    def update_support_capability(self, stats):
+        for pool in stats['pools']:
+            pool['smartpartition'] = (
+                self.check_func_support("SMARTCACHEPARTITION"))
+            pool['smartcache'] = self.check_func_support("smartcachepool")
+            pool['QoS_support'] = self.check_func_support("ioclass")
+            pool['splitmirror'] = self.check_func_support("splitmirror")
+            pool['luncopy'] = self.check_func_support("luncopy")
+            pool['thick_provisioning_support'] = True
+            pool['thin_provisioning_support'] = True
+            pool['smarttier'] = True
+            pool['consistencygroup_support'] = True
+
+            if self.configuration.san_product == "Dorado":
+                pool['smarttier'] = False
+                pool['thick_provisioning_support'] = False
+
+            if self.metro_flag:
+                pool['hypermetro'] = (
+                    self.check_rmt_func_support("HyperMetroPair"))
+                if pool['hypermetro']:
+                    pool['hypermetro'] = (
+                        self.check_func_support("HyperMetroPair"))
+
+            # Asign the support function to global paramenter.
+            self.support_func = pool
 
         return stats
 
     def _get_volume_type(self, volume):
         volume_type = None
-        type_id = volume['volume_type_id']
+        type_id = volume.volume_type_id
         if type_id:
             ctxt = context.get_admin_context()
             volume_type = volume_types.get_volume_type(ctxt, type_id)
@@ -193,7 +221,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
     def _get_consistencygroup_type(self, group):
         specs = {}
         type_id = group['volume_type_id'].split(",")
-        if type_id[0]:
+        if type_id[0] and len(type_id) == 2:
             ctxt = context.get_admin_context()
             volume_type = volume_types.get_volume_type(ctxt, type_id[0])
             specs = dict(volume_type).get('extra_specs')
@@ -277,13 +305,13 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         return opts
 
     def _get_lun_params(self, volume, opts):
-        pool_name = volume_utils.extract_host(volume['host'], level='pool')
+        pool_name = volume_utils.extract_host(volume.host, level='pool')
         params = {
             'TYPE': '11',
-            'NAME': huawei_utils.encode_name(volume['id']),
+            'NAME': huawei_utils.encode_name(volume.id),
             'PARENTTYPE': '216',
             'PARENTID': self.client.get_pool_id(pool_name),
-            'DESCRIPTION': volume['name'],
+            'DESCRIPTION': volume.name,
             'ALLOCTYPE': opts.get('LUNType', self.configuration.lun_type),
             'CAPACITY': huawei_utils.get_volume_size(volume),
             'WRITEPOLICY': self.configuration.lun_write_type,
@@ -296,7 +324,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
             'WRITECACHEPOLICY': self.configuration.lun_write_cache_policy, }
 
         LOG.info(_LI('volume: %(volume)s, lun params: %(params)s.'),
-                 {'volume': volume['id'], 'params': params})
+                 {'volume': volume.id, 'params': params})
         return params
 
     def _create_volume(self, volume, lun_params):
@@ -324,8 +352,13 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         try:
             qos = smartx.SmartQos.get_qos_by_volume_type(volume_type)
             if qos:
-                smart_qos = smartx.SmartQos(self.client)
-                smart_qos.add(qos, lun_id)
+                if not self.support_func.get('QoS_support'):
+                    msg = (_("Can't support qos on the array"))
+                    LOG.error(msg)
+                    raise exception.VolumeBackendAPIException(data=msg)
+                else:
+                    smart_qos = smartx.SmartQos(self.client)
+                    smart_qos.add(qos, lun_id)
 
             smartpartition = smartx.SmartPartition(self.client)
             smartpartition.add(opts, lun_id)
@@ -391,7 +424,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         return model_update
 
     def _delete_volume(self, volume):
-        lun_id = volume.get('provider_location')
+        lun_id = volume.provider_location
         if not lun_id:
             return
 
@@ -409,16 +442,6 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         Secondly, remove associate from QoS policy.
         Thirdly, remove the lun.
         """
-        lun_id = self._check_volume_exist_on_array(
-            volume, constants.VOLUME_NOT_EXISTS_WARN)
-        if not lun_id:
-            return
-
-        qos_id = self.client.get_qosid_by_lunid(lun_id)
-        if qos_id:
-            smart_qos = smartx.SmartQos(self.client)
-            smart_qos.remove(qos_id, lun_id)
-
         metadata = huawei_utils.get_volume_metadata(volume)
         if 'hypermetro_id' in metadata:
             metro = hypermetro.HuaweiHyperMetro(self.client,
@@ -428,20 +451,35 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                 metro.delete_hypermetro(volume)
             except exception.VolumeBackendAPIException as err:
                 LOG.error(_LE('Delete hypermetro error: %s.'), err)
-                # We have checked the LUN WWN above,
-                # no need to check again here.
-                self._delete_volume(volume)
+                lun_id = self._check_volume_exist_on_array(
+                    volume, constants.VOLUME_NOT_EXISTS_WARN)
+                if lun_id:
+                    self._delete_volume(volume)
                 raise
 
         # Delete a replication volume
-        replica_data = volume.get('replication_driver_data')
+        replica_data = volume.replication_driver_data
         if replica_data:
             try:
                 self.replica.delete_replica(volume)
             except exception.VolumeBackendAPIException as err:
                 with excutils.save_and_reraise_exception():
                     LOG.exception(_LE("Delete replication error."))
-                    self._delete_volume(volume)
+                    lun_id = self._check_volume_exist_on_array(
+                        volume, constants.VOLUME_NOT_EXISTS_WARN)
+                    if lun_id:
+                        self._delete_volume(volume)
+
+        lun_id = self._check_volume_exist_on_array(
+            volume, constants.VOLUME_NOT_EXISTS_WARN)
+        if not lun_id:
+            return
+
+        if self.support_func.get('QoS_support'):
+            qos_id = self.client.get_qosid_by_lunid(lun_id)
+            if qos_id:
+                smart_qos = smartx.SmartQos(self.client)
+                smart_qos.remove(qos_id, lun_id)
 
         self._delete_volume(volume)
 
@@ -450,10 +488,11 @@ class HuaweiBaseDriver(driver.VolumeDriver):
             return
 
         if self.client.check_lun_exist(lun_id, lun_wwn):
-            qos_id = self.client.get_qosid_by_lunid(lun_id)
-            if qos_id:
-                smart_qos = smartx.SmartQos(self.client)
-                smart_qos.remove(qos_id, lun_id)
+            if self.support_func.get('QoS_support'):
+                qos_id = self.client.get_qosid_by_lunid(lun_id)
+                if qos_id:
+                    smart_qos = smartx.SmartQos(self.client)
+                    smart_qos.remove(qos_id, lun_id)
 
             self.client.delete_lun(lun_id)
 
@@ -531,26 +570,28 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                                         wait_interval * 10)
 
     def _get_original_status(self, volume):
-        return 'in-use' if volume.get('volume_attachment') else 'available'
+        return 'in-use' if volume.volume_attachment else 'available'
 
     def update_migrated_volume(self, ctxt, volume, new_volume,
                                original_volume_status=None):
-        original_name = huawei_utils.encode_name(volume['id'])
-        current_name = huawei_utils.encode_name(new_volume['id'])
+        original_name = huawei_utils.encode_name(volume.id)
+        current_name = huawei_utils.encode_name(new_volume.id)
 
         lun_id = self.client.get_lun_id_by_name(current_name)
         try:
             self.client.rename_lun(lun_id, original_name)
         except exception.VolumeBackendAPIException:
             LOG.error(_LE('Unable to rename lun %s on array.'), current_name)
-            return {'_name_id': new_volume['_name_id'] or new_volume['id']}
+            return {'_name_id': new_volume.name_id,
+                    'provider_location': new_volume['provider_location']}
 
         LOG.debug("Rename lun from %(current_name)s to %(original_name)s "
                   "successfully.",
                   {'current_name': current_name,
                    'original_name': original_name})
 
-        model_update = {'_name_id': None}
+        model_update = {'_name_id': None,
+                        'provider_location': new_volume['provider_location']}
 
         return model_update
 
@@ -595,7 +636,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         if not self._check_migration_valid(host, volume):
             return (False, None)
 
-        type_id = volume['volume_type_id']
+        type_id = volume.volume_type_id
 
         volume_type = None
         if type_id:
@@ -604,9 +645,9 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         pool_name = host['capabilities']['pool_name']
         pools = self.client.get_all_pools()
         pool_info = self.client.get_pool_info(pool_name, pools)
-        src_volume_name = huawei_utils.encode_name(volume['id'])
+        src_volume_name = huawei_utils.encode_name(volume.id)
         dst_volume_name = six.text_type(hash(src_volume_name))
-        src_id = volume.get('provider_location')
+        src_id = volume.provider_location
 
         opts = None
         qos = None
@@ -644,6 +685,10 @@ class HuaweiBaseDriver(driver.VolumeDriver):
             'WRITECACHEPOLICY': lun_info['WRITECACHEPOLICY'],
             'OWNINGCONTROLLER': lun_info['OWNINGCONTROLLER'], }
 
+        for item in lun_params.keys():
+            if lun_params.get(item) == '--':
+                del lun_params[item]
+
         lun_info = self.client.create_lun(lun_params)
         lun_id = lun_info['ID']
 
@@ -678,23 +723,21 @@ class HuaweiBaseDriver(driver.VolumeDriver):
             LOG.error(err_msg)
             raise exception.VolumeBackendAPIException(data=err_msg)
 
-        snapshotname = huawei_utils.encode_name(snapshot['id'])
-        snapshot_id = snapshot.get('provider_location')
-        if snapshot_id is None:
-            snapshot_id = self.client.get_snapshot_id_by_name(snapshotname)
-        if snapshot_id is None:
-            err_msg = (_(
-                'create_volume_from_snapshot: Snapshot %(name)s '
-                'does not exist.')
-                % {'name': snapshotname})
-            LOG.error(err_msg)
-            raise exception.VolumeBackendAPIException(data=err_msg)
+        snapshot_id = self._check_snapshot_exist_on_array(
+            snapshot, constants.SNAPSHOT_NOT_EXISTS_RAISE)
+
+        snapshot_info = self.client.get_snapshot_info(snapshot_id)
+        # Check whether the snapshot running status is activated.
+        if snapshot_info.get('RUNNINGSTATUS') != constants.STATUS_ACTIVE:
+            msg = (_("Failed to create volume from snapshot: %s. Snapshot "
+                     "running status is not activated.") % snapshot_id)
+            raise exception.VolumeBackendAPIException(data=msg)
 
         lun_params, lun_info, model_update = (
             self._create_base_type_volume(opts, volume, volume_type))
 
         tgt_lun_id = model_update['provider_location']
-        luncopy_name = huawei_utils.encode_name(volume['id'])
+        luncopy_name = huawei_utils.encode_name(volume.id)
         LOG.info(_LI(
             'create_volume_from_snapshot: src_lun_id: %(src_lun_id)s, '
             'tgt_lun_id: %(tgt_lun_id)s, copy_name: %(copy_name)s.'),
@@ -731,12 +774,16 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                                           constants.VOLUME_NOT_EXISTS_RAISE)
 
         # Form the snapshot structure.
-        snapshot = {'id': uuid.uuid4().__str__(),
-                    'volume_id': src_vref['id'],
-                    'volume': src_vref}
+        snapshot = Snapshot(id=uuid.uuid4().__str__(),
+                            volume_id=src_vref.id,
+                            volume=src_vref,
+                            provider_location=None,
+                            metadata={})
 
         # Create snapshot.
-        self.create_snapshot(snapshot)
+        temp_snap = self.create_snapshot(snapshot)
+        snapshot_wwn = temp_snap['metadata']['huawei_snapshot_wwn']
+        snapshot.metadata['huawei_snapshot_wwn'] = snapshot_wwn
 
         try:
             # Create volume from snapshot.
@@ -749,26 +796,35 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                 LOG.warning(_LW(
                     'Failure deleting the snapshot %(snapshot_id)s '
                     'of volume %(volume_id)s.'),
-                    {'snapshot_id': snapshot['id'],
-                     'volume_id': src_vref['id']},)
+                    {'snapshot_id': snapshot.id,
+                     'volume_id': src_vref.id},)
 
         return model_update
 
-    def _check_volume_exist_on_array(self, volume, action):
+    def _check_volume_exist_on_array(self, volume, action, local=True):
         """Check whether the volume exists on the array.
 
         If the volume exists on the array, return the LUN ID.
         If not exists, raise or log warning.
         """
+        # Determine use which client, local or remote.
+        client = self.client if local else self.rmt_client
+
         # Firstly, try to find LUN ID by volume['provider_location'].
-        lun_id = volume.get('provider_location')
+        # Or metadata['remote_lun_id'] which is on the remote array.
+        metadata = huawei_utils.get_volume_metadata(volume)
+        if local:
+            lun_id = volume.provider_location
+        else:
+            lun_id = metadata.get('remote_lun_id')
+
         # If LUN ID not recorded, find LUN ID by LUN NAME.
         if not lun_id:
-            volume_name = huawei_utils.encode_name(volume['id'])
-            lun_id = self.client.get_lun_id_by_name(volume_name)
+            volume_name = huawei_utils.encode_name(volume.id)
+            lun_id = client.get_lun_id_by_name(volume_name)
             if not lun_id:
                 msg = (_("Volume %s does not exist on the array.")
-                       % volume['id'])
+                       % volume.id)
                 if action == constants.VOLUME_NOT_EXISTS_WARN:
                     LOG.warning(msg)
                 if action == constants.VOLUME_NOT_EXISTS_RAISE:
@@ -778,11 +834,11 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         metadata = huawei_utils.get_admin_metadata(volume)
         lun_wwn = metadata.get('huawei_lun_wwn') if metadata else None
         if not lun_wwn:
-            LOG.debug("No LUN WWN recorded for volume %s.", volume['id'])
+            LOG.debug("No LUN WWN recorded for volume %s.", volume.id)
 
-        if not self.client.check_lun_exist(lun_id, lun_wwn):
+        if not client.check_lun_exist(lun_id, lun_wwn):
             msg = (_("Volume %s does not exist on the array.")
-                   % volume['id'])
+                   % volume.id)
             if action == constants.VOLUME_NOT_EXISTS_WARN:
                 LOG.warning(msg)
             if action == constants.VOLUME_NOT_EXISTS_RAISE:
@@ -799,7 +855,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         opts = self._get_volume_params(volume_type)
         if opts.get('replication_enabled') == 'true':
             msg = (_("Can't extend replication volume, volume: %(id)s") %
-                   {"id": volume['id']})
+                   {"id": volume.id})
             LOG.error(msg)
             raise exception.VolumeBackendAPIException(data=msg)
 
@@ -823,7 +879,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                     'newsize': new_size})
             LOG.error(msg)
             raise exception.VolumeBackendAPIException(data=msg)
-        volume_name = huawei_utils.encode_name(volume['id'])
+        volume_name = huawei_utils.encode_name(volume.id)
 
         LOG.info(_LI(
             'Extend volume: %(volumename)s, '
@@ -835,17 +891,17 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         self.client.extend_lun(lun_id, new_size)
 
     def create_snapshot(self, snapshot):
-        volume = snapshot.get('volume')
+        volume = snapshot.volume
         if not volume:
             msg = (_("Can't get volume id from snapshot, snapshot: %(id)s")
-                   % {"id": snapshot['id']})
+                   % {"id": snapshot.id})
             LOG.error(msg)
             raise exception.VolumeBackendAPIException(data=msg)
 
-        volume_name = huawei_utils.encode_name(snapshot['volume_id'])
+        volume_name = huawei_utils.encode_name(snapshot.volume_id)
         lun_id = self.client.get_lun_id(volume, volume_name)
-        snapshot_name = huawei_utils.encode_name(snapshot['id'])
-        snapshot_description = snapshot['id']
+        snapshot_name = huawei_utils.encode_name(snapshot.id)
+        snapshot_description = snapshot.id
         snapshot_info = self.client.create_snapshot(lun_id,
                                                     snapshot_name,
                                                     snapshot_description)
@@ -858,33 +914,46 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                           snapshot_id)
                 self.client.delete_snapshot(snapshot_id)
 
+        metadata = {'huawei_snapshot_wwn': snapshot_info['WWN']}
         return {'provider_location': snapshot_info['ID'],
-                'lun_info': snapshot_info}
+                'lun_info': snapshot_info,
+                'metadata': metadata}
 
     def delete_snapshot(self, snapshot):
-        snapshotname = huawei_utils.encode_name(snapshot['id'])
-        volume_name = huawei_utils.encode_name(snapshot['volume_id'])
+        snapshot_id = self._check_snapshot_exist_on_array(
+            snapshot, constants.SNAPSHOT_NOT_EXISTS_WARN)
+        if not snapshot_id:
+            return
+        self.client.stop_snapshot(snapshot_id)
+        self.client.delete_snapshot(snapshot_id)
 
-        LOG.info(_LI(
-            'stop_snapshot: snapshot name: %(snapshot)s, '
-            'volume name: %(volume)s.'),
-            {'snapshot': snapshotname,
-             'volume': volume_name},)
+    def _check_snapshot_exist_on_array(self, snapshot, action):
+        snapshotname = huawei_utils.encode_name(snapshot.id)
+        snapshot_wwn = ''
+        try:
+            snapshot_wwn = snapshot.metadata['huawei_snapshot_wwn']
+        except KeyError:
+            LOG.warning(_LW("Snapshot %s wwn is not recorded."), snapshotname)
 
-        snapshot_id = snapshot.get('provider_location')
+        snapshot_id = snapshot.provider_location
         if snapshot_id is None:
             snapshot_id = self.client.get_snapshot_id_by_name(snapshotname)
-
-        if snapshot_id and self.client.check_snapshot_exist(snapshot_id):
-            self.client.stop_snapshot(snapshot_id)
-            self.client.delete_snapshot(snapshot_id)
-        else:
-            LOG.warning(_LW("Can't find snapshot on the array."))
+        if not (snapshot_id and
+                self.client.check_snapshot_exist(snapshot_id, snapshot_wwn)):
+            msg = (_("Snapshot %s does not exist on the array.")
+                   % snapshotname)
+            if action == constants.SNAPSHOT_NOT_EXISTS_WARN:
+                LOG.warning(msg)
+            if action == constants.SNAPSHOT_NOT_EXISTS_RAISE:
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+            return
+        return snapshot_id
 
     def retype(self, ctxt, volume, new_type, diff, host):
         """Convert the volume to be of the new type."""
         LOG.debug("Enter retype: id=%(id)s, new_type=%(new_type)s, "
-                  "diff=%(diff)s, host=%(host)s.", {'id': volume['id'],
+                  "diff=%(diff)s, host=%(host)s.", {'id': volume.id,
                                                     'new_type': new_type,
                                                     'diff': diff,
                                                     'host': host})
@@ -1019,12 +1088,47 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
         return lun_opts
 
+    def _check_capability_support(self, new_opts, new_type):
+        new_cache_name = new_opts['cachename']
+        if new_cache_name:
+            if not self.support_func.get('smartcache'):
+                msg = (_(
+                    "Can't support cache on the array, cache name is: "
+                    "%(name)s.") % {'name': new_cache_name})
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+
+        new_partition_name = new_opts['partitionname']
+        if new_partition_name:
+            if not self.support_func.get('smartpartition'):
+                msg = (_(
+                    "Can't support partition on the array, partition name is: "
+                    "%(name)s.") % {'name': new_partition_name})
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+
+        if new_opts['policy']:
+            if (not self.support_func.get('smarttier')
+                    and new_opts['policy'] != '0'):
+                msg = (_("Can't support tier on the array."))
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+
+        new_qos = smartx.SmartQos.get_qos_by_volume_type(new_type)
+        if not self.support_func.get('QoS_support'):
+            if new_qos:
+                msg = (_("Can't support qos on the array."))
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+
     def _check_needed_changes(self, lun_id, old_opts, new_opts,
                               change_opts, new_type):
         new_cache_id = None
         new_cache_name = new_opts['cachename']
         if new_cache_name:
-            new_cache_id = self.client.get_cache_id_by_name(new_cache_name)
+            if self.support_func.get('smartcache'):
+                new_cache_id = self.client.get_cache_id_by_name(
+                    new_cache_name)
             if new_cache_id is None:
                 msg = (_(
                     "Can't find cache name on the array, cache name is: "
@@ -1035,8 +1139,9 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         new_partition_id = None
         new_partition_name = new_opts['partitionname']
         if new_partition_name:
-            new_partition_id = self.client.get_partition_id_by_name(
-                new_partition_name)
+            if self.support_func.get('smartpartition'):
+                new_partition_id = self.client.get_partition_id_by_name(
+                    new_partition_name)
             if new_partition_id is None:
                 msg = (_(
                     "Can't find partition name on the array, partition name "
@@ -1046,26 +1151,37 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
         # smarttier
         if old_opts['policy'] != new_opts['policy']:
-            change_opts['policy'] = (old_opts['policy'], new_opts['policy'])
+            if not (old_opts['policy'] == '--'
+                    and new_opts['policy'] is None):
+                change_opts['policy'] = (old_opts['policy'],
+                                         new_opts['policy'])
 
         # smartcache
         old_cache_id = old_opts['cacheid']
+        if old_cache_id == '--':
+            old_cache_id = None
         if old_cache_id != new_cache_id:
             old_cache_name = None
-            if old_cache_id:
-                cache_info = self.client.get_cache_info_by_id(old_cache_id)
-                old_cache_name = cache_info['NAME']
+            if self.support_func.get('smartcache'):
+                if old_cache_id:
+                    cache_info = self.client.get_cache_info_by_id(
+                        old_cache_id)
+                    old_cache_name = cache_info['NAME']
             change_opts['cacheid'] = ([old_cache_id, old_cache_name],
                                       [new_cache_id, new_cache_name])
 
         # smartpartition
         old_partition_id = old_opts['partitionid']
+        if old_partition_id == '--':
+            old_partition_id = None
         if old_partition_id != new_partition_id:
             old_partition_name = None
-            if old_partition_id:
-                partition_info = self.client.get_partition_info_by_id(
-                    old_partition_id)
-                old_partition_name = partition_info['NAME']
+            if self.support_func.get('smartpartition'):
+                if old_partition_id:
+                    partition_info = self.client.get_partition_info_by_id(
+                        old_partition_id)
+                    old_partition_name = partition_info['NAME']
+
             change_opts['partitionid'] = ([old_partition_id,
                                            old_partition_name],
                                           [new_partition_id,
@@ -1073,10 +1189,16 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
         # smartqos
         new_qos = smartx.SmartQos.get_qos_by_volume_type(new_type)
-        old_qos_id = self.client.get_qosid_by_lunid(lun_id)
-        old_qos = self._get_qos_specs_from_array(old_qos_id)
-        if old_qos != new_qos:
-            change_opts['qos'] = ([old_qos_id, old_qos], new_qos)
+        if not self.support_func.get('QoS_support'):
+            if new_qos:
+                msg = (_("Can't support qos on the array."))
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+        else:
+            old_qos_id = self.client.get_qosid_by_lunid(lun_id)
+            old_qos = self._get_qos_specs_from_array(old_qos_id)
+            if old_qos != new_qos:
+                change_opts['qos'] = ([old_qos_id, old_qos], new_qos)
 
         return change_opts
 
@@ -1093,7 +1215,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
             'replication_type': None,
         }
 
-        lun_id = volume.get('provider_location')
+        lun_id = volume.provider_location
         old_opts = self.get_lun_specs(lun_id)
 
         new_specs = new_type['extra_specs']
@@ -1102,9 +1224,9 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         if 'LUNType' not in new_opts:
             new_opts['LUNType'] = self.configuration.lun_type
 
-        if volume['host'] != host['host']:
+        if volume.host != host['host']:
             migration = True
-            change_opts['host'] = (volume['host'], host['host'])
+            change_opts['host'] = (volume.host, host['host'])
         if old_opts['LUNType'] != new_opts['LUNType']:
             migration = True
             change_opts['LUNType'] = (old_opts['LUNType'], new_opts['LUNType'])
@@ -1157,10 +1279,25 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         """Remove an export for a volume."""
         pass
 
+    def create_export_snapshot(self, context, snapshot, connector):
+        """Exports the snapshot."""
+        pass
+
+    def remove_export_snapshot(self, context, snapshot):
+        """Removes an export for a snapshot."""
+        pass
+
+    def backup_use_temp_snapshot(self):
+        # This config option has a default to be False, So just return it.
+        return self.configuration.safe_get("backup_use_temp_snapshot")
+
     def _copy_volume(self, volume, copy_name, src_lun, tgt_lun):
+        metadata = huawei_utils.get_volume_metadata(volume)
+        copyspeed = metadata.get('copyspeed')
         luncopy_id = self.client.create_luncopy(copy_name,
                                                 src_lun,
-                                                tgt_lun)
+                                                tgt_lun,
+                                                copyspeed)
         wait_interval = self.configuration.lun_copy_wait_interval
 
         try:
@@ -1217,44 +1354,47 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                 existing_ref=external_ref, reason=msg)
 
         # Check whether the LUN exists in a HyperMetroPair.
-        try:
-            hypermetro_pairs = self.client.get_hypermetro_pairs()
-        except exception.VolumeBackendAPIException:
-            hypermetro_pairs = []
-            LOG.debug("Can't get hypermetro info, pass the check.")
+        if self.support_func.get('hypermetro'):
+            try:
+                hypermetro_pairs = self.client.get_hypermetro_pairs()
+            except exception.VolumeBackendAPIException:
+                hypermetro_pairs = []
+                LOG.debug("Can't get hypermetro info, pass the check.")
 
-        for pair in hypermetro_pairs:
-            if pair.get('LOCALOBJID') == lun_id:
-                msg = (_("Can't import LUN %s to Cinder. Already exists in a "
-                         "HyperMetroPair.") % lun_id)
-                raise exception.ManageExistingInvalidReference(
-                    existing_ref=external_ref, reason=msg)
+            for pair in hypermetro_pairs:
+                if pair.get('LOCALOBJID') == lun_id:
+                    msg = (_("Can't import LUN %s to Cinder. Already exists "
+                             "in a HyperMetroPair.") % lun_id)
+                    raise exception.ManageExistingInvalidReference(
+                        existing_ref=external_ref, reason=msg)
 
         # Check whether the LUN exists in a SplitMirror.
-        try:
-            split_mirrors = self.client.get_split_mirrors()
-        except exception.VolumeBackendAPIException as ex:
-            if re.search('License is unavailable', ex.msg):
-                # Can't check whether the LUN has SplitMirror with it,
-                # just pass the check and log it.
-                split_mirrors = []
-                LOG.warning(_LW('No license for SplitMirror.'))
-            else:
-                msg = _("Failed to get SplitMirror.")
-                raise exception.VolumeBackendAPIException(data=msg)
-
-        for mirror in split_mirrors:
+        if self.support_func.get('splitmirror'):
             try:
-                target_luns = self.client.get_target_luns(mirror.get('ID'))
-            except exception.VolumeBackendAPIException:
-                msg = _("Failed to get target LUN of SplitMirror.")
-                raise exception.VolumeBackendAPIException(data=msg)
+                split_mirrors = self.client.get_split_mirrors()
+            except exception.VolumeBackendAPIException as ex:
+                if re.search('License is unavailable', ex.msg):
+                    # Can't check whether the LUN has SplitMirror with it,
+                    # just pass the check and log it.
+                    split_mirrors = []
+                    LOG.warning(_LW('No license for SplitMirror.'))
+                else:
+                    msg = _("Failed to get SplitMirror.")
+                    raise exception.VolumeBackendAPIException(data=msg)
 
-            if (mirror.get('PRILUNID') == lun_id) or (lun_id in target_luns):
-                msg = (_("Can't import LUN %s to Cinder. Already exists in a "
-                         "SplitMirror.") % lun_id)
-                raise exception.ManageExistingInvalidReference(
-                    existing_ref=external_ref, reason=msg)
+            for mirror in split_mirrors:
+                try:
+                    target_luns = self.client.get_target_luns(mirror.get('ID'))
+                except exception.VolumeBackendAPIException:
+                    msg = _("Failed to get target LUN of SplitMirror.")
+                    raise exception.VolumeBackendAPIException(data=msg)
+
+                if ((mirror.get('PRILUNID') == lun_id)
+                        or (lun_id in target_luns)):
+                    msg = (_("Can't import LUN %s to Cinder. Already exists "
+                             "in a SplitMirror.") % lun_id)
+                    raise exception.ManageExistingInvalidReference(
+                        existing_ref=external_ref, reason=msg)
 
         # Check whether the LUN exists in a migration task.
         try:
@@ -1278,12 +1418,13 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                     existing_ref=external_ref, reason=msg)
 
         # Check whether the LUN exists in a LUN copy task.
-        lun_copy = lun_info.get('LUNCOPYIDS')
-        if lun_copy and lun_copy[1:-1]:
-            msg = (_("Can't import LUN %s to Cinder. Already exists in "
-                     "a LUN copy task.") % lun_id)
-            raise exception.ManageExistingInvalidReference(
-                existing_ref=external_ref, reason=msg)
+        if self.support_func.get('luncopy'):
+            lun_copy = lun_info.get('LUNCOPYIDS')
+            if lun_copy and lun_copy[1:-1]:
+                msg = (_("Can't import LUN %s to Cinder. Already exists in "
+                         "a LUN copy task.") % lun_id)
+                raise exception.ManageExistingInvalidReference(
+                    existing_ref=external_ref, reason=msg)
 
         # Check whether the LUN exists in a remote replication task.
         rmt_replication = lun_info.get('REMOTEREPLICATIONIDS')
@@ -1296,14 +1437,14 @@ class HuaweiBaseDriver(driver.VolumeDriver):
     def manage_existing(self, volume, external_ref):
         """Manage an existing volume on the backend storage."""
         # Check whether the LUN is belonged to the specified pool.
-        pool = volume_utils.extract_host(volume['host'], 'pool')
+        pool = volume_utils.extract_host(volume.host, 'pool')
         LOG.debug("Pool specified is: %s.", pool)
         lun_info = self._get_lun_info_by_ref(external_ref)
         lun_id = lun_info.get('ID')
         description = lun_info.get('DESCRIPTION', '')
         if len(description) <= (
-                constants.MAX_VOL_DESCRIPTION - len(volume['name']) - 1):
-            description = volume['name'] + ' ' + description
+                constants.MAX_VOL_DESCRIPTION - len(volume.name) - 1):
+            description = volume.name + ' ' + description
 
         lun_pool = lun_info.get('PARENTNAME')
         LOG.debug("Storage pool of existing LUN %(lun)s is %(pool)s.",
@@ -1316,7 +1457,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
         # Check other stuffs to determine whether this LUN can be imported.
         self._check_lun_valid_for_manage(lun_info, external_ref)
-        type_id = volume.get('volume_type_id')
+        type_id = volume.volume_type_id
         new_opts = None
         if type_id:
             # Handle volume type if specified.
@@ -1330,15 +1471,18 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                          "LUN type mismatched.") % lun_id)
                 raise exception.ManageExistingVolumeTypeMismatch(reason=msg)
             if volume_type:
+                self._check_capability_support(new_opts, volume_type)
+
                 change_opts = {'policy': None, 'partitionid': None,
                                'cacheid': None, 'qos': None}
+
                 change_opts = self._check_needed_changes(lun_id, old_opts,
                                                          new_opts, change_opts,
                                                          volume_type)
                 self.modify_lun(lun_id, change_opts)
 
         # Rename the LUN to make it manageable for Cinder.
-        new_name = huawei_utils.encode_name(volume['id'])
+        new_name = huawei_utils.encode_name(volume.id)
         LOG.debug("Rename LUN %(old_name)s to %(new_name)s.",
                   {'old_name': lun_info.get('NAME'),
                    'new_name': new_name})
@@ -1384,7 +1528,19 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
     def unmanage(self, volume):
         """Export Huawei volume from Cinder."""
-        LOG.debug("Unmanage volume: %s.", volume['id'])
+        lun_id = self._check_volume_exist_on_array(
+            volume, constants.VOLUME_NOT_EXISTS_WARN)
+        if not lun_id:
+            return
+
+        # Remove volume uuid from array lun description.
+        lun_info = self.client.get_lun_info(lun_id)
+        description = lun_info.get('DESCRIPTION', '')
+        des_list = description.split(volume.name)
+        des = ' '.join(des.strip() for des in des_list)
+        self.client.update_obj_desc(lun_id, des)
+
+        LOG.debug("Unmanage volume: %s.", volume.id)
 
     def manage_existing_get_size(self, volume, external_ref):
         """Get the size of the existing volume."""
@@ -1435,8 +1591,8 @@ class HuaweiBaseDriver(driver.VolumeDriver):
     def manage_existing_snapshot(self, snapshot, existing_ref):
         snapshot_info = self._get_snapshot_info_by_ref(existing_ref)
         snapshot_id = snapshot_info.get('ID')
-        volume = snapshot.get('volume')
-        lun_id = volume.get('provider_location')
+        volume = snapshot.volume
+        lun_id = volume.provider_location
         if lun_id != snapshot_info.get('PARENTID'):
             msg = (_("Can't import snapshot %s to Cinder. "
                      "Snapshot doesn't belong to volume."), snapshot_id)
@@ -1446,9 +1602,15 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         # Check whether this snapshot can be imported.
         self._check_snapshot_valid_for_manage(snapshot_info, existing_ref)
 
+        # Add snapshot uuid to array snapshot description and
+        # keep the original array snapshot description.
+        description = snapshot_info.get('DESCRIPTION', '')
+        if len(description) <= (
+                constants.MAX_VOL_DESCRIPTION - len(snapshot.id) - 1):
+            description = snapshot.id + ' ' + description
+
         # Rename the snapshot to make it manageable for Cinder.
-        description = snapshot['id']
-        snapshot_name = huawei_utils.encode_name(snapshot['id'])
+        snapshot_name = huawei_utils.encode_name(snapshot.id)
         self.client.rename_snapshot(snapshot_id, snapshot_name, description)
         if snapshot_info.get('RUNNINGSTATUS') != constants.STATUS_ACTIVE:
             self.client.activate_snapshot(snapshot_id)
@@ -1457,7 +1619,9 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                   {'old_name': snapshot_info.get('NAME'),
                    'new_name': snapshot_name})
 
-        return {'provider_location': snapshot_id}
+        metadata = {'huawei_snapshot_wwn': snapshot_info['WWN']}
+        return {'provider_location': snapshot_id,
+                'metadata': metadata}
 
     def manage_existing_snapshot_get_size(self, snapshot, existing_ref):
         """Get the size of the existing snapshot."""
@@ -1473,25 +1637,19 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
     def unmanage_snapshot(self, snapshot):
         """Unmanage the specified snapshot from Cinder management."""
-        LOG.debug("Unmanage snapshot: %s.", snapshot['id'])
-        snapshot_name = huawei_utils.encode_name(snapshot['id'])
-        snapshot_id = self.client.get_snapshot_id_by_name(snapshot_name)
+        snapshot_id = self._check_snapshot_exist_on_array(
+            snapshot, constants.SNAPSHOT_NOT_EXISTS_WARN)
         if not snapshot_id:
-            LOG.warning(_LW("Can't find snapshot on the array: %s."),
-                        snapshot_name)
             return
-        new_name = snapshot_name
-        LOG.debug("Rename snapshot %(snapshot_name)s to %(new_name)s.",
-                  {'snapshot_name': snapshot_name,
-                   'new_name': new_name})
 
-        try:
-            self.client.rename_snapshot(snapshot_id, new_name)
-        except Exception:
-            LOG.warning(_LW("Failed to rename snapshot %(snapshot_id)s, "
-                            "snapshot name on array is %(snapshot_name)s."),
-                        {'snapshot_id': snapshot['id'],
-                         'snapshot_name': snapshot_name})
+        # Remove snapshot uuid from array lun description.
+        snapshot_info = self.client.get_snapshot_info(snapshot_id)
+        description = snapshot_info.get('DESCRIPTION', '')
+        des_list = description.split(snapshot.id)
+        des = ' '.join(des.strip() for des in des_list)
+        self.client.update_obj_desc(snapshot_id, des, constants.SNAPSHOT_TYPE)
+
+        LOG.debug("Unmanage snapshot: %s.", snapshot.id)
 
     def remove_host_with_check(self, host_id):
         wwns_in_host = (
@@ -1501,65 +1659,6 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         if not (wwns_in_host or iqns_in_host or
            self.client.is_host_associated_to_hostgroup(host_id)):
             self.client.remove_host(host_id)
-
-    def create_consistencygroup(self, context, group):
-        """Creates a consistencygroup."""
-        model_update = {'status': 'available'}
-        opts = self._get_consistencygroup_type(group)
-        if (opts.get('hypermetro') == 'true'):
-            metro = hypermetro.HuaweiHyperMetro(self.client,
-                                                self.rmt_client,
-                                                self.configuration)
-            metro.create_consistencygroup(group)
-        else:
-            err_msg = (_('The consistencygroup: %(group_id)s '
-                         'does not support the current '
-                         'volumetype: %(volume_type)s.')
-                       % {'group_id': group['id'],
-                          'volume_type': opts},)
-            LOG.error(err_msg)
-            raise exception.VolumeBackendAPIException(data=err_msg)
-
-        return model_update
-
-    def delete_consistencygroup(self, context, group, volumes):
-        opts = self._get_consistencygroup_type(group)
-        if opts.get('hypermetro') == 'true':
-            metro = hypermetro.HuaweiHyperMetro(self.client,
-                                                self.rmt_client,
-                                                self.configuration)
-            return metro.delete_consistencygroup(context, group, volumes)
-        else:
-            err_msg = (_('The consistencygroup: %(group_id)s '
-                         'does not support the current '
-                         'volumetype: %(volume_type)s.')
-                       % {'group_id': group['id'],
-                          'volume_type': opts},)
-            LOG.error(err_msg)
-            raise exception.VolumeBackendAPIException(data=err_msg)
-
-    def update_consistencygroup(self, context, group,
-                                add_volumes,
-                                remove_volumes):
-        model_update = {'status': 'available'}
-        opts = self._get_consistencygroup_type(group)
-        if opts.get('hypermetro') == 'true':
-            metro = hypermetro.HuaweiHyperMetro(self.client,
-                                                self.rmt_client,
-                                                self.configuration)
-            metro.update_consistencygroup(context, group,
-                                          add_volumes,
-                                          remove_volumes)
-        else:
-            err_msg = (_('The consistencygroup: %(group_id)s '
-                         'does not support the current '
-                         'volumetype: %(volume_type)s.')
-                       % {'group_id': group['id'],
-                          'volume_type': opts},)
-            LOG.error(err_msg)
-            raise exception.VolumeBackendAPIException(data=err_msg)
-
-        return model_update, None, None
 
     def _classify_volume(self, volumes):
         normal_volumes = []
@@ -1579,7 +1678,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         volumes_update = []
         for v in volumes:
             v_update = {}
-            v_update['volume_id'] = v['id']
+            v_update['volume_id'] = v.id
             metadata = huawei_utils.get_volume_metadata(v)
             old_status = 'available'
             if 'old_status' in metadata:
@@ -1619,7 +1718,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
         for v in volumes:
             v_update = {}
-            v_update['volume_id'] = v['id']
+            v_update['volume_id'] = v.id
             metadata = huawei_utils.get_volume_metadata(v)
             metadata.update({'old_status': v['status']})
             v_update['updates'] = {'status': 'error',
@@ -1665,6 +1764,79 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
         return secondary_id, volumes_update
 
+    def initialize_connection_snapshot(self, snapshot, connector, **kwargs):
+        """Map a snapshot to a host and return target iSCSI information."""
+        LOG.info(_LI('initialize_connection_snapshot for snapshot: '
+                     '%(snapshot_id)s.')
+                 % {'snapshot_id': snapshot.id})
+
+        # From the volume structure.
+        volume = Volume(id=snapshot.id,
+                        provider_location=snapshot.provider_location,
+                        lun_type=constants.SNAPSHOT_TYPE,
+                        metadata=None)
+
+        return self.initialize_connection(volume, connector)
+
+    def terminate_connection_snapshot(self, snapshot, connector, **kwargs):
+        """Delete map between a snapshot and a host."""
+        LOG.info(_LI('terminate_connection_snapshot for snapshot: '
+                     '%(snapshot_id)s.')
+                 % {'snapshot_id': snapshot.id})
+
+        # From the volume structure.
+        volume = Volume(id=snapshot.id,
+                        provider_location=snapshot.provider_location,
+                        lun_type=constants.SNAPSHOT_TYPE,
+                        metadata=None)
+
+        return self.terminate_connection(volume, connector)
+
+    def get_lun_id_and_type(self, volume, action, local=True):
+        if hasattr(volume, 'lun_type'):
+            lun_id = volume.provider_location
+            lun_type = constants.SNAPSHOT_TYPE
+            sp_info = self.client.get_snapshot_info(lun_id)
+            if not self.client.check_snapshot_exist(lun_id):
+                msg = (_LE("Snapshot %s does not exist on the array.")
+                       % volume.id)
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+
+            if (sp_info.get('HEALTHSTATUS') != constants.STATUS_HEALTH or
+                    sp_info.get('RUNNINGSTATUS') != constants.STATUS_ACTIVE):
+                msg = (_LE("Snapshot %s status is not normal "
+                           "or running status is not online.") % lun_id)
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+        else:
+            lun_id = self._check_volume_exist_on_array(
+                volume, action, local)
+            lun_type = constants.LUN_TYPE
+
+        return lun_id, lun_type
+
+    def _get_same_hostid(self, loc_fc_info, rmt_fc_info):
+        loc_aval_luns = loc_fc_info['aval_luns']
+        loc_aval_luns = json.loads(loc_aval_luns)
+
+        rmt_aval_luns = rmt_fc_info['aval_luns']
+        rmt_aval_luns = json.loads(rmt_aval_luns)
+        same_host_id = None
+
+        for i in range(1, 512):
+            if i in rmt_aval_luns and i in loc_aval_luns:
+                same_host_id = i
+                break
+
+        LOG.info(_LI("The same hostid is: %s."), same_host_id)
+        if not same_host_id:
+            msg = _("Can't find the same host id from arrays.")
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+
+        return same_host_id
+
 
 class HuaweiISCSIDriver(HuaweiBaseDriver, driver.ISCSIDriver):
     """ISCSI driver for Huawei storage arrays.
@@ -1684,9 +1856,16 @@ class HuaweiISCSIDriver(HuaweiBaseDriver, driver.ISCSIDriver):
         2.0.2 - Refactor HuaweiISCSIDriver
         2.0.3 - Manage/unmanage snapshot support
         2.0.5 - Replication V2 support
+        2.0.6 - Support iSCSI configuration in Replication
+        2.0.7 - Hypermetro support
+                Hypermetro consistency group support
+                Consistency group support
+                Cgsnapshot support
+        2.0.8 - Backup snapshot optimal path support
+        2.0.9 - Support reporting disk type of pool
     """
 
-    VERSION = "2.0.5"
+    VERSION = "2.0.9"
 
     def __init__(self, *args, **kwargs):
         super(HuaweiISCSIDriver, self).__init__(*args, **kwargs)
@@ -1704,19 +1883,80 @@ class HuaweiISCSIDriver(HuaweiBaseDriver, driver.ISCSIDriver):
     @utils.synchronized('huawei', external=True)
     def initialize_connection(self, volume, connector):
         """Map a volume to a host and return target iSCSI information."""
-        lun_id = self._check_volume_exist_on_array(
-            volume, constants.VOLUME_NOT_EXISTS_RAISE)
+        # Attach local lun.
+        iscsi_info = self._initialize_connection(volume, connector)
+
+        # Attach remote lun if exists.
+        metadata = huawei_utils.get_volume_metadata(volume)
+        LOG.info(_LI("Attach Volume, metadata is: %s."), metadata)
+        if 'hypermetro_id' in metadata:
+            try:
+                rmt_iscsi_info = (
+                    self._initialize_connection(volume, connector, False))
+            except Exception:
+                with excutils.save_and_reraise_exception():
+                    self._terminate_connection(volume, connector)
+
+            loc_map_info = iscsi_info['data']['map_info']
+            rmt_map_info = rmt_iscsi_info['data']['map_info']
+            same_host_id = self._get_same_hostid(loc_map_info, rmt_map_info)
+
+            self.client.change_hostlun_id(loc_map_info, same_host_id)
+            self.rmt_client.change_hostlun_id(rmt_map_info, same_host_id)
+
+            multipath = connector.get('multipath', False)
+            if multipath:
+                target_iqn = []
+                target_iqn.extend(iscsi_info['data']['target_iqns'])
+                target_iqn.extend(rmt_iscsi_info['data']['target_iqns'])
+                iscsi_info['data']['target_iqns'] = target_iqn
+
+                target_portal = []
+                target_portal.extend(iscsi_info['data']['target_portals'])
+                target_portal.extend(rmt_iscsi_info['data']['target_portals'])
+                iscsi_info['data']['target_portals'] = target_portal
+                iscsi_info['data']['target_luns'] = [same_host_id]
+            elif self.use_ultrapath:
+                target_iqn = []
+                target_iqn.extend(iscsi_info['data']['target_iqns'])
+                target_iqn.extend(rmt_iscsi_info['data']['target_iqns'])
+                iscsi_info['data']['target_iqns'] = target_iqn
+                target_portal = []
+                target_portal.extend(iscsi_info['data']['target_portals'])
+                target_portal.extend(rmt_iscsi_info['data']['target_portals'])
+                iscsi_info['data']['target_portals'] = target_portal
+                iscsi_info['data']['target_luns'] = [same_host_id]
+            else:
+                msg = (_("Hypermetro must use multipath or ultrapath."))
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+
+        LOG.info(_LI('initialize_common_connection_iscsi, '
+                     'return data is: %s.'), iscsi_info)
+        return iscsi_info
+
+    def _initialize_connection(self, volume, connector, local=True):
+        LOG.info(_LI('_initialize_connection, attach %(local)s volume.'),
+                 {'local': 'local' if local else 'remote'})
+
+        # Determine use which client, local or remote.
+        client = self.client if local else self.rmt_client
+
+        lun_id, lun_type = self.get_lun_id_and_type(
+            volume, constants.VOLUME_NOT_EXISTS_RAISE, local)
+        lun_info = client.get_lun_info(lun_id)
 
         initiator_name = connector['initiator']
         LOG.info(_LI(
             'initiator name: %(initiator_name)s, '
-            'LUN ID: %(lun_id)s.'),
+            'LUN ID: %(lun_id)s, lun type: %(lun_type)s.'),
             {'initiator_name': initiator_name,
-             'lun_id': lun_id})
+             'lun_id': lun_id,
+             'lun_type': lun_type})
 
         (iscsi_iqns,
          target_ips,
-         portgroup_id) = self.client.get_iscsi_params(connector)
+         portgroup_id) = client.get_iscsi_params(connector)
         LOG.info(_LI('initialize_connection, iscsi_iqn: %(iscsi_iqn)s, '
                      'target_ip: %(target_ip)s, '
                      'portgroup_id: %(portgroup_id)s.'),
@@ -1727,50 +1967,57 @@ class HuaweiISCSIDriver(HuaweiBaseDriver, driver.ISCSIDriver):
         # Create hostgroup if not exist.
         original_host_name = connector['host']
         host_name = huawei_utils.encode_host_name(original_host_name)
-        host_id = self.client.add_host_with_check(host_name,
-                                                  original_host_name)
+        host_id = client.add_host_with_check(host_name, original_host_name)
         try:
-            self.client.ensure_initiator_added(initiator_name, host_id)
+            client.ensure_initiator_added(initiator_name, host_id)
         except Exception:
             with excutils.save_and_reraise_exception():
                 self.remove_host_with_check(host_id)
 
-        hostgroup_id = self.client.add_host_to_hostgroup(host_id)
+        hostgroup_id = client.add_host_to_hostgroup(host_id)
 
         # Mapping lungroup and hostgroup to view.
-        self.client.do_mapping(lun_id, hostgroup_id,
-                               host_id, portgroup_id)
+        map_info = client.do_mapping(lun_id, hostgroup_id, host_id,
+                                     portgroup_id, lun_type)
 
-        hostlun_id = self.client.get_host_lun_id(host_id, lun_id)
+        hostlun_id = client.get_host_lun_id(host_id, lun_id, lun_type)
 
         LOG.info(_LI("initialize_connection, host lun id is: %s."),
                  hostlun_id)
 
-        chapinfo = self.client.find_chap_info(self.configuration.iscsi_info,
-                                              initiator_name)
+        chapinfo = client.find_chap_info(client.iscsi_info, initiator_name)
         if (not chapinfo
-                and self.client.is_initiator_used_chap(initiator_name)):
+                and client.is_initiator_used_chap(initiator_name)):
             msg = (_("Chap is not configed but initiator %s used chap on "
-                     "array, please cheak and remove chap for this initiator.")
+                     "array, please check and remove chap for this initiator.")
                    % initiator_name)
             LOG.error(msg)
             raise exception.VolumeBackendAPIException(data=msg)
 
         # Return iSCSI properties.
         properties = {}
+        properties['map_info'] = map_info
         properties['target_discovered'] = False
-        properties['volume_id'] = volume['id']
+        properties['volume_id'] = volume.id
         multipath = connector.get('multipath', False)
         hostlun_id = int(hostlun_id)
-        if not multipath:
-            properties['target_portal'] = ('%s:3260' % target_ips[0])
-            properties['target_iqn'] = iscsi_iqns[0]
-            properties['target_lun'] = hostlun_id
-        else:
+        if multipath:
             properties['target_iqns'] = [iqn for iqn in iscsi_iqns]
             properties['target_portals'] = [
                 '%s:3260' % ip for ip in target_ips]
             properties['target_luns'] = [hostlun_id] * len(target_ips)
+        elif self.use_ultrapath:
+            properties['target_iqns'] = [iqn for iqn in iscsi_iqns]
+            properties['target_portals'] = [
+                '%s:3260' % ip for ip in target_ips]
+            properties['target_luns'] = [hostlun_id] * len(target_ips)
+            properties['target_num'] = len(target_ips)
+            properties['libvirt_iscsi_use_ultrapath'] = self.use_ultrapath
+            properties['lun_wwn'] = lun_info['WWN']
+        else:
+            properties['target_portal'] = ('%s:3260' % target_ips[0])
+            properties['target_iqn'] = iscsi_iqns[0]
+            properties['target_lun'] = hostlun_id
 
         LOG.info(_LI("initialize_connection success. Return data: %s."),
                  properties)
@@ -1787,23 +2034,41 @@ class HuaweiISCSIDriver(HuaweiBaseDriver, driver.ISCSIDriver):
     @utils.synchronized('huawei', external=True)
     def terminate_connection(self, volume, connector, **kwargs):
         """Delete map between a volume and a host."""
-        lun_id = self._check_volume_exist_on_array(
-            volume, constants.VOLUME_NOT_EXISTS_WARN)
+        metadata = huawei_utils.get_volume_metadata(volume)
+        LOG.info(_LI("terminate_connection, metadata is: %s."), metadata)
+        self._terminate_connection(volume, connector)
+
+        if 'hypermetro_id' in metadata:
+            self._terminate_connection(volume, connector, False)
+
+        LOG.info(_LI('terminate_connection success.'))
+
+    def _terminate_connection(self, volume, connector, local=True):
+        LOG.info(_LI('_terminate_connection, detach %(local)s volume.'),
+                 {'local': 'local' if local else 'remote'})
+
+        # Determine use which client, local or remote.
+        client = self.client if local else self.rmt_client
+
+        lun_id, lun_type = self.get_lun_id_and_type(
+            volume, constants.VOLUME_NOT_EXISTS_WARN, local)
+
         initiator_name = connector['initiator']
         host_name = connector['host']
         lungroup_id = None
 
         LOG.info(_LI(
             'terminate_connection: initiator name: %(ini)s, '
-            'LUN ID: %(lunid)s.'),
+            'LUN ID: %(lunid)s, lun type: %(lun_type)s.'),
             {'ini': initiator_name,
-             'lunid': lun_id},)
+             'lunid': lun_id,
+             'lun_type': lun_type})
 
         portgroup = None
         portgroup_id = None
         view_id = None
         left_lunnum = -1
-        for ini in self.configuration.iscsi_info:
+        for ini in client.iscsi_info:
             if ini['Name'] == initiator_name:
                 for key in ini:
                     if key == 'TargetPortGroup':
@@ -1811,21 +2076,20 @@ class HuaweiISCSIDriver(HuaweiBaseDriver, driver.ISCSIDriver):
                         break
 
         if portgroup:
-            portgroup_id = self.client.get_tgt_port_group(portgroup)
+            portgroup_id = client.get_tgt_port_group(portgroup)
         host_name = huawei_utils.encode_host_name(host_name)
-        host_id = self.client.get_host_id_by_name(host_name)
+        host_id = client.get_host_id_by_name(host_name)
         if host_id:
             mapping_view_name = constants.MAPPING_VIEW_PREFIX + host_id
-            view_id = self.client.find_mapping_view(mapping_view_name)
+            view_id = client.find_mapping_view(mapping_view_name)
             if view_id:
-                lungroup_id = self.client.find_lungroup_from_map(view_id)
+                lungroup_id = client.find_lungroup_from_map(view_id)
 
         # Remove lun from lungroup.
         if lun_id and lungroup_id:
-            lungroup_ids = self.client.get_lungroupids_by_lunid(lun_id)
+            lungroup_ids = client.get_lungroupids_by_lunid(lun_id, lun_type)
             if lungroup_id in lungroup_ids:
-                self.client.remove_lun_from_lungroup(lungroup_id,
-                                                     lun_id)
+                client.remove_lun_from_lungroup(lungroup_id, lun_id, lun_type)
             else:
                 LOG.warning(_LW("LUN is not in lungroup. "
                                 "LUN ID: %(lun_id)s. "
@@ -1835,34 +2099,28 @@ class HuaweiISCSIDriver(HuaweiBaseDriver, driver.ISCSIDriver):
 
         # Remove portgroup from mapping view if no lun left in lungroup.
         if lungroup_id:
-            left_lunnum = self.client.get_lunnum_from_lungroup(lungroup_id)
+            left_lunnum = client.get_obj_count_from_lungroup(lungroup_id)
 
         if portgroup_id and view_id and (int(left_lunnum) <= 0):
-            if self.client.is_portgroup_associated_to_view(view_id,
-                                                           portgroup_id):
-                self.client.delete_portgroup_mapping_view(view_id,
-                                                          portgroup_id)
+            if client.is_portgroup_associated_to_view(view_id, portgroup_id):
+                client.delete_portgroup_mapping_view(view_id, portgroup_id)
         if view_id and (int(left_lunnum) <= 0):
-            self.client.remove_chap(initiator_name)
+            client.remove_chap(initiator_name)
 
-            if self.client.lungroup_associated(view_id, lungroup_id):
-                self.client.delete_lungroup_mapping_view(view_id,
-                                                         lungroup_id)
-            self.client.delete_lungroup(lungroup_id)
-            if self.client.is_initiator_associated_to_host(initiator_name,
-                                                           host_id):
-                self.client.remove_iscsi_from_host(initiator_name)
+            if client.lungroup_associated(view_id, lungroup_id):
+                client.delete_lungroup_mapping_view(view_id, lungroup_id)
+            client.delete_lungroup(lungroup_id)
+            if client.is_initiator_associated_to_host(initiator_name, host_id):
+                client.remove_iscsi_from_host(initiator_name)
             hostgroup_name = constants.HOSTGROUP_PREFIX + host_id
-            hostgroup_id = self.client.find_hostgroup(hostgroup_name)
+            hostgroup_id = client.find_hostgroup(hostgroup_name)
             if hostgroup_id:
-                if self.client.hostgroup_associated(view_id, hostgroup_id):
-                    self.client.delete_hostgoup_mapping_view(view_id,
-                                                             hostgroup_id)
-                self.client.remove_host_from_hostgroup(hostgroup_id,
-                                                       host_id)
-                self.client.delete_hostgroup(hostgroup_id)
-            self.client.remove_host(host_id)
-            self.client.delete_mapping_view(view_id)
+                if client.hostgroup_associated(view_id, hostgroup_id):
+                    client.delete_hostgoup_mapping_view(view_id, hostgroup_id)
+                client.remove_host_from_hostgroup(hostgroup_id, host_id)
+                client.delete_hostgroup(hostgroup_id)
+            client.remove_host(host_id)
+            client.delete_mapping_view(view_id)
 
 
 class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
@@ -1884,9 +2142,15 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
         2.0.3 - Manage/unmanage snapshot support
         2.0.4 - Balanced FC port selection
         2.0.5 - Replication V2 support
+        2.0.7 - Hypermetro support
+                Hypermetro consistency group support
+                Consistency group support
+                Cgsnapshot support
+        2.0.8 - Backup snapshot optimal path support
+        2.0.9 - Support reporting disk type of pool
     """
 
-    VERSION = "2.0.5"
+    VERSION = "2.0.9"
 
     def __init__(self, *args, **kwargs):
         super(HuaweiFCDriver, self).__init__(*args, **kwargs)
@@ -1905,18 +2169,19 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
     @utils.synchronized('huawei', external=True)
     @fczm_utils.AddFCZone
     def initialize_connection(self, volume, connector):
-        lun_id = self._check_volume_exist_on_array(
+        lun_id, lun_type = self.get_lun_id_and_type(
             volume, constants.VOLUME_NOT_EXISTS_RAISE)
+        lun_info = self.client.get_lun_info(lun_id)
 
         wwns = connector['wwpns']
         LOG.info(_LI(
             'initialize_connection, initiator: %(wwpns)s,'
-            ' LUN ID: %(lun_id)s.'),
+            ' LUN ID: %(lun_id)s, lun type: %(lun_type)s.'),
             {'wwpns': wwns,
-             'lun_id': lun_id},)
+             'lun_id': lun_id,
+             'lun_type': lun_type})
 
         portg_id = None
-
         original_host_name = connector['host']
         host_name = huawei_utils.encode_host_name(original_host_name)
         host_id = self.client.add_host_with_check(host_name,
@@ -1930,7 +2195,8 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
             zone_helper = fc_zone_helper.FCZoneHelper(self.fcsan, self.client)
             try:
                 (tgt_port_wwns, portg_id, init_targ_map) = (
-                    zone_helper.build_ini_targ_map(wwns, host_id, lun_id))
+                    zone_helper.build_ini_targ_map(wwns, host_id, lun_id,
+                                                   lun_type))
             except Exception as err:
                 self.remove_host_with_check(host_id)
                 msg = _('build_ini_targ_map fails. %s') % err
@@ -1943,6 +2209,11 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
             online_wwns_in_host = (
                 self.client.get_host_online_fc_initiators(host_id))
             online_free_wwns = self.client.get_online_free_wwns()
+            fc_initiators_on_array = self.client.get_fc_initiator_on_array()
+            wwns = [i for i in wwns if i in fc_initiators_on_array]
+            LOG.info(_LI("initialize_connection, "
+                         "online initiators on the array: %s."), wwns)
+
             for wwn in wwns:
                 if (wwn not in online_wwns_in_host
                         and wwn not in online_free_wwns):
@@ -1971,17 +2242,22 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
         # Add host into hostgroup.
         hostgroup_id = self.client.add_host_to_hostgroup(host_id)
         map_info = self.client.do_mapping(lun_id, hostgroup_id,
-                                          host_id, portg_id)
-        host_lun_id = self.client.get_host_lun_id(host_id, lun_id)
+                                          host_id, portg_id,
+                                          lun_type)
+        host_lun_id = self.client.get_host_lun_id(host_id, lun_id,
+                                                  lun_type)
 
         # Return FC properties.
         fc_info = {'driver_volume_type': 'fibre_channel',
                    'data': {'target_lun': int(host_lun_id),
                             'target_discovered': True,
                             'target_wwn': tgt_port_wwns,
-                            'volume_id': volume['id'],
+                            'volume_id': volume.id,
                             'initiator_target_map': init_targ_map,
-                            'map_info': map_info}, }
+                            'map_info': map_info,
+                            'lun_wwn': lun_info['WWN'],
+                            'libvirt_iscsi_use_ultrapath':
+                            self.use_ultrapath}, }
 
         # Deal with hypermetro connection.
         metadata = huawei_utils.get_volume_metadata(volume)
@@ -2019,37 +2295,15 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
             hyperm.rmt_client.change_hostlun_id(rmt_map_info, same_host_id)
 
             fc_info['data']['target_lun'] = same_host_id
-            hyperm.rmt_client.logout()
 
         LOG.info(_LI("Return FC info is: %s."), fc_info)
         return fc_info
-
-    def _get_same_hostid(self, loc_fc_info, rmt_fc_info):
-        loc_aval_luns = loc_fc_info['aval_luns']
-        loc_aval_luns = json.loads(loc_aval_luns)
-
-        rmt_aval_luns = rmt_fc_info['aval_luns']
-        rmt_aval_luns = json.loads(rmt_aval_luns)
-        same_host_id = None
-
-        for i in range(1, 512):
-            if i in rmt_aval_luns and i in loc_aval_luns:
-                same_host_id = i
-                break
-
-        LOG.info(_LI("The same hostid is: %s."), same_host_id)
-        if not same_host_id:
-            msg = _("Can't find the same host id from arrays.")
-            LOG.error(msg)
-            raise exception.VolumeBackendAPIException(data=msg)
-
-        return same_host_id
 
     @utils.synchronized('huawei', external=True)
     @fczm_utils.RemoveFCZone
     def terminate_connection(self, volume, connector, **kwargs):
         """Delete map between a volume and a host."""
-        lun_id = self._check_volume_exist_on_array(
+        lun_id, lun_type = self.get_lun_id_and_type(
             volume, constants.VOLUME_NOT_EXISTS_WARN)
 
         wwns = connector['wwpns']
@@ -2059,8 +2313,8 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
         lungroup_id = None
         view_id = None
         LOG.info(_LI('terminate_connection: wwpns: %(wwns)s, '
-                     'LUN ID: %(lun_id)s.'),
-                 {'wwns': wwns, 'lun_id': lun_id})
+                     'LUN ID: %(lun_id)s, lun type: %(lun_type)s.'),
+                 {'wwns': wwns, 'lun_id': lun_id, 'lun_type': lun_type})
 
         host_name = huawei_utils.encode_host_name(host_name)
         host_id = self.client.get_host_id_by_name(host_name)
@@ -2071,10 +2325,12 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
                 lungroup_id = self.client.find_lungroup_from_map(view_id)
 
         if lun_id and lungroup_id:
-            lungroup_ids = self.client.get_lungroupids_by_lunid(lun_id)
+            lungroup_ids = self.client.get_lungroupids_by_lunid(lun_id,
+                                                                lun_type)
             if lungroup_id in lungroup_ids:
                 self.client.remove_lun_from_lungroup(lungroup_id,
-                                                     lun_id)
+                                                     lun_id,
+                                                     lun_type)
             else:
                 LOG.warning(_LW("LUN is not in lungroup. "
                                 "LUN ID: %(lun_id)s. "
@@ -2085,7 +2341,7 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
         else:
             LOG.warning(_LW("Can't find lun on the array."))
         if lungroup_id:
-            left_lunnum = self.client.get_lunnum_from_lungroup(lungroup_id)
+            left_lunnum = self.client.get_obj_count_from_lungroup(lungroup_id)
         if int(left_lunnum) > 0:
             fc_info = {'driver_volume_type': 'fibre_channel',
                        'data': {}}

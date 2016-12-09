@@ -13,6 +13,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
+import contextlib
+import threading
 import time
 
 from oslo.utils import units
@@ -23,6 +26,13 @@ from cinder.i18n import _
 from cinder.openstack.common import log as logging
 from cinder.openstack.common import loopingcall
 from cinder.volume.drivers.huawei import constants
+
+try:
+    import eventlet
+    from eventlet import patcher as eventlet_patcher
+except ImportError:
+    eventlet = None
+    eventlet_patcher = None
 
 LOG = logging.getLogger(__name__)
 
@@ -72,8 +82,8 @@ def get_volume_size(volume):
     calculates volume size with sectors, which is 512 bytes.
     """
     volume_size = units.Gi / 512  # 1G
-    if int(volume['size']) != 0:
-        volume_size = int(volume['size']) * units.Gi / 512
+    if int(volume.size) != 0:
+        volume_size = int(volume.size) * units.Gi / 512
 
     return volume_size
 
@@ -89,19 +99,141 @@ def get_volume_metadata(volume):
 def get_admin_metadata(volume):
     admin_metadata = {}
     if 'admin_metadata' in volume:
-        admin_metadata = volume['admin_metadata']
+        admin_metadata = volume.admin_metadata
     elif 'volume_admin_metadata' in volume:
         metadata = volume.get('volume_admin_metadata', [])
         admin_metadata = dict((item['key'], item['value']) for item in metadata)
 
     LOG.debug("Volume ID: %(id)s, admin_metadata: %(admin_metadata)s.",
-              {"id": volume['id'], "admin_metadata": admin_metadata})
+              {"id": volume.id, "admin_metadata": admin_metadata})
     return admin_metadata
 
 
 def get_snapshot_metadata_value(snapshot):
     if 'snapshot_metadata' in snapshot:
-        metadata = snapshot.get('snapshot_metadata')
+        metadata = snapshot.snapshot_metadata
         return dict((item['key'], item['value']) for item in metadata)
 
     return {}
+
+
+class ReaderWriterLock(object):
+    WRITER = 'w'
+    READER = 'r'
+
+    @staticmethod
+    def _fetch_current_thread_functor():
+        if eventlet is not None and eventlet_patcher is not None:
+            if eventlet_patcher.is_monkey_patched('thread'):
+                return eventlet.getcurrent
+        return threading.current_thread
+
+    def __init__(self):
+        self._writer = None
+        self._pending_writers = collections.deque()
+        self._readers = {}
+        self._cond = threading.Condition()
+        self._current_thread = self._fetch_current_thread_functor()
+
+    @property
+    def has_pending_writers(self):
+        """Returns if there are writers waiting to become the *one* writer."""
+        return bool(self._pending_writers)
+
+    def is_writer(self, check_pending=True):
+        """Returns if the caller is the active writer or a pending writer."""
+        me = self._current_thread()
+        if self._writer == me:
+            return True
+        if check_pending:
+            return me in self._pending_writers
+        else:
+            return False
+
+    @property
+    def owner(self):
+        """Returns whether the lock is locked by a writer or reader."""
+        if self._writer is not None:
+            return self.WRITER
+        if self._readers:
+            return self.READER
+        return None
+
+    def is_reader(self):
+        """Returns if the caller is one of the readers."""
+        me = self._current_thread()
+        return me in self._readers
+
+    @contextlib.contextmanager
+    def read_lock(self):
+        """Context manager that grants a read lock.
+        Will wait until no active or pending writers.
+        Raises a ``RuntimeError`` if a pending writer tries to acquire
+        a read lock.
+        """
+        me = self._current_thread()
+        if me in self._pending_writers:
+            raise RuntimeError("Writer %s can not acquire a read lock"
+                               " while waiting for the write lock"
+                               % me)
+        with self._cond:
+            while True:
+                # No active writer, or we are the writer;
+                # we are good to become a reader.
+                if self._writer is None or self._writer == me:
+                    try:
+                        self._readers[me] = self._readers[me] + 1
+                    except KeyError:
+                        self._readers[me] = 1
+                    break
+                # An active writer; guess we have to wait.
+                self._cond.wait()
+        try:
+            yield self
+        finally:
+            # I am no longer a reader, remove *one* occurrence of myself.
+            # If the current thread acquired two read locks, then it will
+            # still have to remove that other read lock; this allows for
+            # basic reentrancy to be possible.
+            with self._cond:
+                try:
+                    me_instances = self._readers[me]
+                    if me_instances > 1:
+                        self._readers[me] = me_instances - 1
+                    else:
+                        self._readers.pop(me)
+                except KeyError:
+                    pass
+                self._cond.notify_all()
+
+    @contextlib.contextmanager
+    def write_lock(self):
+        """Context manager that grants a write lock.
+        Will wait until no active readers. Blocks readers after acquiring.
+        Raises a ``RuntimeError`` if an active reader attempts to acquire
+        a lock.
+        """
+        me = self._current_thread()
+        i_am_writer = self.is_writer(check_pending=False)
+        if self.is_reader() and not i_am_writer:
+            raise RuntimeError("Reader %s to writer privilege"
+                               " escalation not allowed" % me)
+        if i_am_writer:
+            # Already the writer; this allows for basic reentrancy.
+            yield self
+        else:
+            with self._cond:
+                self._pending_writers.append(me)
+                while True:
+                    # No readers, and no active writer, am I next??
+                    if len(self._readers) == 0 and self._writer is None:
+                        if self._pending_writers[0] == me:
+                            self._writer = self._pending_writers.popleft()
+                            break
+                    self._cond.wait()
+            try:
+                yield self
+            finally:
+                with self._cond:
+                    self._writer = None
+                    self._cond.notify_all()

@@ -369,7 +369,6 @@ class TseriesClient(object):
         return lun_id
 
     def _get_lun_wwn(self, lun_id):
-        lun_wwn = None
         cli_cmd = ('showlun -lun %s' % lun_id)
         out = self._execute_cli(cli_cmd)
         if re.search('LUN Information', out):
@@ -384,6 +383,12 @@ class TseriesClient(object):
             LOG.debug('Got LUN WWN %(lun_wwn)s for LUN %(lun_id)s'
                       % {'lun_wwn': lun_wwn,
                          'lun_id': lun_id})
+        elif re.search('The object does not exist', out):
+            lun_wwn = None
+        else:
+            err_msg = (_("Get LUN wwn error. CLI out: %s") % out)
+            LOG.error(err_msg)
+            raise exception.VolumeBackendAPIException(data=err_msg)
         return lun_wwn
 
     @utils.synchronized('huawei', external=False)
@@ -416,7 +421,11 @@ class TseriesClient(object):
                 time.sleep(1)
                 count = count + 1
 
-        lun_wwn = self._get_lun_wwn(lun_id)
+        try:
+            lun_wwn = self._get_lun_wwn(lun_id)
+        except Exception:
+            LOG.warning(_LW("Get LUN wwn error, setting it to 'None'."))
+            lun_wwn = 'None'
 
         model_update = {}
         metadata = huawei_utils.get_volume_metadata(volume)
@@ -894,7 +903,11 @@ class TseriesClient(object):
         tgt_vol_id = self._create_volume(volume_name, volume_size, parameters)
         self._copy_volume(snapshot_id, tgt_vol_id)
 
-        lun_wwn = self._get_lun_wwn(tgt_vol_id)
+        try:
+            lun_wwn = self._get_lun_wwn(tgt_vol_id)
+        except Exception:
+            LOG.warning(_LW("Get LUN wwn error, setting it to 'None'."))
+            lun_wwn = 'None'
 
         model_update = {}
         metadata = huawei_utils.get_volume_metadata(volume)
@@ -1014,7 +1027,11 @@ class TseriesClient(object):
         tgt_vol_id = self._create_volume(tgt_vol_name, tgt_vol_size, params)
         self._copy_volume(src_vol_id, tgt_vol_id)
 
-        lun_wwn = self._get_lun_wwn(tgt_vol_id)
+        try:
+            lun_wwn = self._get_lun_wwn(tgt_vol_id)
+        except Exception:
+            LOG.warning(_LW("Get LUN wwn error, setting it to 'None'."))
+            lun_wwn = 'None'
 
         model_update = {}
         metadata = huawei_utils.get_volume_metadata(tgt_volume)
@@ -1258,7 +1275,14 @@ class TseriesClient(object):
     def _check_snapshot_created(self, snapshot_id):
         cli_cmd = 'showsnapshot -snapshot %(snap)s' % {'snap': snapshot_id}
         out = self._execute_cli(cli_cmd)
-        return (True if re.search('Snapshot Information', out) else False)
+        if re.search('Snapshot Information', out):
+            return True
+        elif re.search('Current LUN is not a LUN snapshot', out):
+            return False
+        else:
+            msg = (_("Check snapshot created error. CLI out: %s") % out)
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
 
     def _snapshot_in_luncopy(self, snapshot_id):
         for name in self.luncopy_list:
@@ -2232,7 +2256,7 @@ class TseriesClient(object):
             # Cut-point of multipal details, usually is "-------".
             if len(line) == 1:
                 port_details.append(tmp_details)
-		tmp_details = {}
+                tmp_details = {}
                 continue
             key = ''.join(line[0].strip().split())
             val = line[1].strip()

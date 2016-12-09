@@ -23,6 +23,7 @@ from oslo.utils import excutils
 from cinder import exception
 from cinder.i18n import _, _LI, _LE, _LW
 from cinder.openstack.common import log as logging
+from cinder import utils
 from cinder.volume import driver
 from cinder.volume.drivers.huawei.extend import fc_zone_helper
 from cinder.volume.drivers.huawei import ssh_client
@@ -32,7 +33,6 @@ LOG = logging.getLogger(__name__)
 
 FC_PORT_CONNECTED = '10'
 contrs = ['A', 'B']
-HUAWEI_CONNECTOR_TYPE_INITIATOR_V1 = 'huawei_connector_type'
 
 zone_manager_opts = [
     cfg.StrOpt('zone_driver',
@@ -168,12 +168,7 @@ class HuaweiTISCSIDriver(driver.ISCSIDriver):
             msg = _("Volume %s not exists on the array.") % volume['id']
             raise exception.VolumeBackendAPIException(data=msg)
 
-        try:
-            hostlun_id = self.sshclient.map_volume(host_id, lun_id)
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                # Remove the iSCSI port from the host if the map failed.
-                self._remove_iscsi_port(host_id, connector['initiator'])
+        hostlun_id = self.sshclient.map_volume(host_id, lun_id)
 
         # Change LUN ctr for better performance, just for single path.
         lun_details = self.sshclient.get_lun_details(lun_id)
@@ -235,12 +230,8 @@ class HuaweiTISCSIDriver(driver.ISCSIDriver):
         if not lun_id:
             msg = _("Volume %s not exists on the array.") % volume['id']
             raise exception.VolumeBackendAPIException(data=msg)
-        try:
-            hostlun_id = self.sshclient.map_volume(host_id, lun_id)
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                # Remove the iSCSI port from the host if the map failed.
-                self._remove_iscsi_port(host_id, connector['initiator'])
+
+        hostlun_id = self.sshclient.map_volume(host_id, lun_id)
 
         # Change LUN ctr for better performance, just for single path.
         lun_details = self.sshclient.get_lun_details(lun_id)
@@ -261,6 +252,7 @@ class HuaweiTISCSIDriver(driver.ISCSIDriver):
 
         return {'driver_volume_type': 'iscsi', 'data': properties}
 
+    @utils.synchronized('huawei_t_mount', external=False)
     def initialize_connection(self, volume, connector):
         """Map a volume to a host and return target iSCSI information."""
         if 'nova_use_ultrapath' in connector:
@@ -327,35 +319,7 @@ class HuaweiTISCSIDriver(driver.ISCSIDriver):
         iscsiinfo['Initiator'] = initiator_list
         return iscsiinfo
 
-    def _detach_initiator(self, iqn, lun_id, host_id):
-        LOG.info(_LI('Detach iSCSI initiators.'))
-
-        port_info = []
-        if host_id:
-            port_info = self.sshclient.get_host_port_info(host_id)
-
-        # Check if all the initiators need to be removed.
-        need_delete_map = True
-        if port_info:
-            for port in port_info:
-                if port[2] != iqn:
-                    need_delete_map = False
-                    break
-
-        # Need to delete mapping infos.
-        if need_delete_map:
-            self._detach_volume_map(iqn, lun_id, host_id)
-            return
-
-        # Just remove initiators
-        if host_id:
-            self._remove_iscsi_port(host_id, iqn)
-
-    def _detach_volume_map(self, iqn, lun_id, host_id):
-        self.sshclient.remove_map(lun_id, host_id)
-        if host_id and not self.sshclient.get_host_map_info(host_id):
-            self._remove_iscsi_port(host_id, iqn)
-
+    @utils.synchronized('huawei_t_mount', external=False)
     def terminate_connection(self, volume, connector, **kwargs):
         """Terminate the map."""
         # Check the connector, as we can't get initiatorname during
@@ -382,10 +346,7 @@ class HuaweiTISCSIDriver(driver.ISCSIDriver):
             LOG.warning(_LW("Volume %s not exists on the array."),
                         volume['id'])
         host_id = self.sshclient.get_host_id(host_name, iqn)
-        if HUAWEI_CONNECTOR_TYPE_INITIATOR_V1 in connector:
-            self._detach_initiator(iqn, lun_id, host_id)
-        else:
-            self._detach_volume_map(iqn, lun_id, host_id)
+        self.sshclient.remove_map(lun_id, host_id)
 
         if (host_id is not None
                 and not self.sshclient.get_host_map_info(host_id)):
@@ -504,6 +465,7 @@ class HuaweiTFCDriver(driver.FibreChannelDriver):
             LOG.error(err_msg)
             raise exception.InvalidConnectorException(missing='wwpns')
 
+    @utils.synchronized('huawei_t_mount', external=False)
     def initialize_connection(self, volume, connector):
         """Create FC connection between a volume and a host."""
         LOG.debug('initialize_connection: volume name: %(vol)s, '
@@ -564,6 +526,7 @@ class HuaweiTFCDriver(driver.FibreChannelDriver):
             wwns.append(port['TargetWWN'])
         return wwns
 
+    @utils.synchronized('huawei_t_mount', external=False)
     def terminate_connection(self, volume, connector, **kwargs):
         """Terminate the map."""
         wwns = connector['wwpns']
@@ -581,46 +544,16 @@ class HuaweiTFCDriver(driver.FibreChannelDriver):
 
         self.sshclient.update_login_info()
         host_id = self.sshclient.get_host_id(host_name)
-        if HUAWEI_CONNECTOR_TYPE_INITIATOR_V1 in connector:
-            self._detach_initiators(wwns, lun_id, host_id)
-        else:
-            self._detach_volume_map_fc(wwns, lun_id, host_id)
+        self.sshclient.remove_map(lun_id, host_id)
+
+        # Remove all FC ports and delete the host if no volume mapping to it.
+        if host_id and not self.sshclient.get_host_map_info(host_id):
+            self._delete_zone_and_remove_initiators(wwns, host_id)
 
         info = {'driver_volume_type': 'fibre_channel',
                 'data': {'wwns': wwns}}
         LOG.info(_LI('terminate_connection, return data is: %s.'), info)
         return info
-
-    def _detach_initiators(self, wwns, lun_id, host_id):
-        LOG.info(_LI('Detach fc initiators.'))
-
-        port_info = []
-        if host_id:
-            port_info = self.sshclient.get_host_port_info(host_id)
-
-        # Check if all the initiators need to be removed.
-        need_delete_map = True
-        if port_info:
-            for port in port_info:
-                if port[2] not in wwns:
-                    need_delete_map = False
-                    break
-
-        # Need to delete mapping infos.
-        if need_delete_map:
-            self._detach_volume_map_fc(wwns, lun_id, host_id)
-            return
-
-        # Just remove initiators
-        self._delete_zone_and_remove_initiators(wwns, host_id)
-
-    def _detach_volume_map_fc(self, wwns, lun_id, host_id):
-        LOG.info(_LI('Detach FC volume.'))
-
-        self.sshclient.remove_map(lun_id, host_id)
-        # Remove all FC ports and delete the host if no volume mapping to it.
-        if host_id and not self.sshclient.get_host_map_info(host_id):
-            self._delete_zone_and_remove_initiators(wwns, host_id)
 
     def _delete_zone_and_remove_initiators(self, wwns, host_id):
         if host_id is None:

@@ -19,6 +19,7 @@ from cinder import context
 from cinder import exception
 from cinder.i18n import _, _LI
 from cinder.openstack.common import log as logging
+from cinder import utils
 from cinder.volume.drivers.huawei import constants
 from cinder.volume import qos_specs
 
@@ -100,6 +101,7 @@ class SmartQos(object):
 
         return False
 
+    @utils.synchronized('huawei_qos', external=True)
     def add(self, qos, lun_id):
         policy_id = None
         try:
@@ -123,13 +125,14 @@ class SmartQos(object):
                 if policy_id is not None:
                     self.client.delete_qos_policy(policy_id)
 
+    @utils.synchronized('huawei_qos', external=True)
     def remove(self, qos_id, lun_id):
         qos_info = self.client.get_qos_info(qos_id)
         lun_list = self.client.get_lun_list_in_qos(qos_id, qos_info)
         if len(lun_list) <= 1:
             qos_status = qos_info['RUNNINGSTATUS']
             # 2: Active status.
-            if qos_status == constants.STATUS_QOS_ACTIVE:
+            if qos_status != constants.STATUS_QOS_INACTIVATED:
                 self.client.activate_deactivate_qos(qos_id, False)
             self.client.delete_qos_policy(qos_id)
         else:

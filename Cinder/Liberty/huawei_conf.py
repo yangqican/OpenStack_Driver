@@ -125,6 +125,13 @@ class HuaweiConf(object):
             LOG.error(msg)
             raise exception.InvalidInput(reason=msg)
 
+        if text not in constants.VALID_PRODUCT:
+            msg = (_("Invalid SAN product '%(text)s', SAN product must be in "
+                     "%(valid)s.")
+                   % {'text': text, 'valid': constants.VALID_PRODUCT})
+            LOG.error(msg)
+            raise exception.InvalidInput(reason=msg)
+
         product = text.strip()
         setattr(self.conf, 'san_product', product)
 
@@ -132,6 +139,13 @@ class HuaweiConf(object):
         text = xml_root.findtext('Storage/Protocol')
         if not text:
             msg = _("SAN protocol is not configured.")
+            LOG.error(msg)
+            raise exception.InvalidInput(reason=msg)
+
+        if text not in constants.VALID_PROTOCOL:
+            msg = (_("Invalid SAN protocol '%(text)s', SAN protocol must be "
+                     "in %(valid)s.")
+                   % {'text': text, 'valid': constants.VALID_PROTOCOL})
             LOG.error(msg)
             raise exception.InvalidInput(reason=msg)
 
@@ -157,27 +171,67 @@ class HuaweiConf(object):
 
     def _lun_ready_wait_interval(self, xml_root):
         text = xml_root.findtext('LUN/LUNReadyWaitInterval')
+
+        if text and not text.isdigit():
+            msg = (_("Invalid LUN_Ready_Wait_Interval '%s', "
+                     "LUN_Ready_Wait_Interval must be a digit.")
+                   % text)
+            LOG.error(msg)
+            raise exception.InvalidInput(reason=msg)
+
         interval = text.strip() if text else constants.DEFAULT_WAIT_INTERVAL
         setattr(self.conf, 'lun_ready_wait_interval', int(interval))
 
     def _lun_copy_wait_interval(self, xml_root):
         text = xml_root.findtext('LUN/LUNcopyWaitInterval')
+
+        if text and not text.isdigit():
+            msg = (_("Invalid LUN_Copy_Wait_Interval '%s', "
+                     "LUN_Copy_Wait_Interval must be a digit.")
+                   % text)
+            LOG.error(msg)
+            raise exception.InvalidInput(reason=msg)
+
         interval = text.strip() if text else constants.DEFAULT_WAIT_INTERVAL
         setattr(self.conf, 'lun_copy_wait_interval', int(interval))
 
     def _lun_timeout(self, xml_root):
         text = xml_root.findtext('LUN/Timeout')
+
+        if text and not text.isdigit():
+            msg = (_("Invalid LUN timeout '%s', LUN timeout must be a digit.")
+                   % text)
+            LOG.error(msg)
+            raise exception.InvalidInput(reason=msg)
+
         interval = text.strip() if text else constants.DEFAULT_WAIT_TIMEOUT
         setattr(self.conf, 'lun_timeout', int(interval))
 
     def _lun_write_type(self, xml_root):
         text = xml_root.findtext('LUN/WriteType')
         write_type = text.strip() if text else '1'
+
+        if write_type not in constants.VALID_WRITE_TYPE:
+            msg = (_("Invalid LUN WriteType '%(text)s', LUN WriteType must be "
+                     "in %(valid)s.")
+                   % {'text': write_type, 'valid': constants.VALID_WRITE_TYPE})
+            LOG.error(msg)
+            raise exception.InvalidInput(reason=msg)
+
         setattr(self.conf, 'lun_write_type', write_type)
 
     def _lun_mirror_switch(self, xml_root):
         text = xml_root.findtext('LUN/MirrorSwitch')
         mirror_switch = text.strip() if text else '1'
+
+        if mirror_switch not in constants.VALID_MIRROR_SWICTH:
+            msg = (_("Invalid LUN MirrorSwitch '%(text)s', LUN MirrorSwitch "
+                     "must be in %(valid)s.")
+                   % {'text': mirror_switch,
+                      'valid': constants.VALID_MIRROR_SWICTH})
+            LOG.error(msg)
+            raise exception.InvalidInput(reason=msg)
+
         setattr(self.conf, 'lun_mirror_switch', mirror_switch)
 
     def _lun_prefetch(self, xml_root):
@@ -252,6 +306,73 @@ class HuaweiConf(object):
 
         setattr(self.conf, 'iscsi_info', iscsi_info)
 
+    def _parse_rmt_iscsi_info(self, iscsi_info):
+        if not (iscsi_info and iscsi_info.strip()):
+            return []
+
+        # Consider iscsi_info value:
+        # ' {Name:xxx ;;TargetPortGroup: xxx};\n'
+        # '{Name:\t\rxxx;CHAPinfo: mm-usr#mm-pwd} '
+
+        # Step 1, ignore whitespace characters, convert to:
+        # '{Name:xxx;;TargetPortGroup:xxx};{Name:xxx;CHAPinfo:mm-usr#mm-pwd}'
+        iscsi_info = ''.join(iscsi_info.split())
+
+        # Step 2, make initiators configure list, convert to:
+        # ['Name:xxx;;TargetPortGroup:xxx', 'Name:xxx;CHAPinfo:mm-usr#mm-pwd']
+        initiator_infos = iscsi_info[1:-1].split('};{')
+
+        # Step 3, get initiator configure pairs, convert to:
+        # [['Name:xxx', '', 'TargetPortGroup:xxx'],
+        #  ['Name:xxx', 'CHAPinfo:mm-usr#mm-pwd']]
+        initiator_infos = map(lambda x: x.split(';'), initiator_infos)
+
+        # Step 4, remove invalid configure pairs, convert to:
+        # [['Name:xxx', 'TargetPortGroup:xxx'],
+        # ['Name:xxx', 'CHAPinfo:mm-usr#mm-pwd']]
+        initiator_infos = map(lambda x: filter(lambda y: y, x),
+                              initiator_infos)
+
+        # Step 5, make initiators configure dict, convert to:
+        # [{'TargetPortGroup': 'xxx', 'Name': 'xxx'},
+        #  {'Name': 'xxx', 'CHAPinfo': 'mm-usr#mm-pwd'}]
+        get_opts = lambda x: x.split(':', 1)
+        initiator_infos = map(lambda x: dict(map(get_opts, x)),
+                              initiator_infos)
+        # Convert generator to list for py3 compatibility.
+        initiator_infos = list(initiator_infos)
+
+        # Step 6, replace CHAPinfo 'user#pwd' to 'user;pwd'
+        key = 'CHAPinfo'
+        for info in initiator_infos:
+            if key in info:
+                info[key] = info[key].replace('#', ';', 1)
+
+        return initiator_infos
+
+    def get_hypermetro_devices(self):
+        devs = self.conf.safe_get('hypermetro_device')
+        if not devs:
+            return []
+
+        devs_config = []
+        for dev in devs:
+            dev_config = {}
+            dev_config['san_address'] = dev['san_address'].split(';')
+            dev_config['san_user'] = dev['san_user']
+            dev_config['san_password'] = dev['san_password']
+            dev_config['metro_domain'] = dev['metro_domain']
+            dev_config['storage_pools'] = dev['storage_pool'].split(';')
+            dev_config['iscsi_info'] = self._parse_rmt_iscsi_info(
+                dev.get('iscsi_info'))
+            dev_config['iscsi_default_target_ip'] = (
+                dev['iscsi_default_target_ip'].split(';')
+                if 'iscsi_default_target_ip' in dev
+                else [])
+            devs_config.append(dev_config)
+
+        return devs_config
+
     def get_replication_devices(self):
         devs = self.conf.safe_get('replication_device')
         if not devs:
@@ -264,8 +385,9 @@ class HuaweiConf(object):
             dev_config['san_address'] = dev['san_address'].split(';')
             dev_config['san_user'] = dev['san_user']
             dev_config['san_password'] = dev['san_password']
-            dev_config['storage_pool'] = dev['storage_pool'].split(';')
-            dev_config['iscsi_info'] = []
+            dev_config['storage_pools'] = dev['storage_pool'].split(';')
+            dev_config['iscsi_info'] = self._parse_rmt_iscsi_info(
+                dev.get('iscsi_info'))
             dev_config['iscsi_default_target_ip'] = (
                 dev['iscsi_default_target_ip'].split(';')
                 if 'iscsi_default_target_ip' in dev
@@ -280,7 +402,7 @@ class HuaweiConf(object):
             'san_address': self.conf.san_address,
             'san_user': self.conf.san_user,
             'san_password': self.conf.san_password,
-            'storage_pool': self.conf.storage_pools,
+            'storage_pools': self.conf.storage_pools,
             'iscsi_info': self.conf.iscsi_info,
             'iscsi_default_target_ip': self.conf.iscsi_default_target_ip,
         }

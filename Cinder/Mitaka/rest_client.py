@@ -14,11 +14,14 @@
 #    under the License.
 
 import json
-import re
+import netaddr
 import socket
 import ssl
+import threading
 import time
+import urllib2
 
+from oslo_concurrency import lockutils
 from oslo_log import log as logging
 from oslo_utils import excutils
 import six
@@ -50,6 +53,9 @@ class RestClient(object):
         self.iscsi_default_target_ip = kwargs.get(
             'iscsi_default_target_ip',
             self.configuration.iscsi_default_target_ip)
+        self.metro_domain = kwargs.get('metro_domain', None)
+        self.semaphore = threading.Semaphore(20)
+        self.call_lock = lockutils.ReaderWriterLock()
 
     def init_http_head(self):
         self.cookie = http_cookiejar.CookieJar()
@@ -58,10 +64,11 @@ class RestClient(object):
         self.headers = {
             "Connection": "keep-alive",
             "Content-Type": "application/json",
+            "iBaseToken": "None",
         }
 
     def do_call(self, url=None, data=None, method=None,
-                calltimeout=constants.SOCKET_TIMEOUT):
+                calltimeout=constants.SOCKET_TIMEOUT, filter_flag=False):
         """Send requests to Huawei storage server.
 
         Send HTTPS call, get response in JSON.
@@ -73,7 +80,7 @@ class RestClient(object):
         opener = urllib.request.build_opener(handler)
         urllib.request.install_opener(opener)
         res_json = None
-
+        self.semaphore.acquire()
         try:
             create_unverified_https_context = ssl._create_unverified_context
         except AttributeError:
@@ -85,43 +92,45 @@ class RestClient(object):
 
         try:
             socket.setdefaulttimeout(calltimeout)
-            masked_data = None
             if data:
-                if 'CHAPPASSWORD' in data:
-                    # We won't print the password in the log.
-                    masked_data = data.copy()
-                    masked_data['CHAPNAME'] = '******'
-                    masked_data['CHAPPASSWORD'] = '******'
-                    masked_data = json.dumps(masked_data)
                 data = json.dumps(data)
             req = urllib.request.Request(url, data, self.headers)
             if method:
                 req.get_method = lambda: method
             res = urllib.request.urlopen(req).read().decode("utf-8")
+            res_json = json.loads(res)
 
-            if "xx/sessions" not in url:
+            if not filter_flag:
                 LOG.info(_LI('\n\n\n\nRequest URL: %(url)s\n\n'
                              'Call Method: %(method)s\n\n'
                              'Request Data: %(data)s\n\n'
                              'Response Data:%(res)s\n\n'),
                          {'url': url,
                           'method': method,
-                          'data': data if not masked_data else masked_data,
+                          'data': data,
                           'res': res})
 
         except Exception as err:
+            # If the array does not support the request, For example,
+            # the interface is not supported, the array will return HTTPError
+            # 404.
+            if (isinstance(err, urllib2.HTTPError)
+                    and err.code == constants.HTTP_ERROR_NOT_FOUND):
+                json_msg = ('{"error":{"code": %s,"description": "Not '
+                            'Found."}}') % constants.HTTP_ERROR_NOT_FOUND
+                res_json = json.loads(json_msg)
+                self.semaphore.release()
+                return res_json
+
             LOG.error(_LE('Bad response from server: %(url)s.'
                           ' Error: %(err)s'), {'url': url, 'err': err})
             json_msg = ('{"error":{"code": %s,"description": "Connect to '
                         'server error."}}') % constants.ERROR_CONNECT_TO_SERVER
             res_json = json.loads(json_msg)
+            self.semaphore.release()
             return res_json
 
-        try:
-            res_json = json.loads(res)
-        except Exception as err:
-            LOG.error(_LE('JSON transfer error: %s.'), err)
-            raise
+        self.semaphore.release()
 
         return res_json
 
@@ -135,7 +144,8 @@ class RestClient(object):
                     "scope": "0"}
             self.init_http_head()
             result = self.do_call(url, data,
-                                  calltimeout=constants.LOGIN_SOCKET_TIMEOUT)
+                                  calltimeout=constants.LOGIN_SOCKET_TIMEOUT,
+                                  filter_flag=True)
 
             if (result['error']['code'] != 0) or ("data" not in result):
                 LOG.error(_LE("Login error. URL: %(url)s\n"
@@ -143,7 +153,7 @@ class RestClient(object):
                           {"url": item_url, "reason": result})
                 continue
 
-            LOG.debug('Login success: %(url)s', {'url': item_url})
+            LOG.info(_LI('Login success: %(url)s'), {'url': item_url})
             device_id = result['data']['deviceid']
             self.device_id = device_id
             self.url = item_url + device_id
@@ -170,30 +180,56 @@ class RestClient(object):
         except Exception as err:
             LOG.warning(_LW('Login failed. Error: %s.'), err)
 
-    @utils.synchronized('huawei_cinder_call')
-    def call(self, url, data=None, method=None):
+    def relogin(self, old_token):
+        """Relogin Huawei storage array
+
+        When batch apporation failed
+        """
+        if (self.url is None
+                or old_token == self.headers['iBaseToken']):
+            old_url = self.url
+            try:
+                self.login()
+            except Exception:
+                return False
+            LOG.info(_LI('Replace URL: \n'
+                         'Old URL: %(old_url)s\n,'
+                         'New URL: %(new_url)s\n.'),
+                     {'old_url': old_url,
+                      'new_url': self.url})
+        else:
+            LOG.info(_LI('Relogin has been successed by other thread.'))
+        return True
+
+    def call(self, url, data=None, method=None, filter_flag=False):
         """Send requests to server.
 
         If fail, try another RestURL.
         """
-        device_id = None
-        old_url = self.url
-        result = self.do_call(url, data, method)
+        with self.call_lock.read_lock():
+            old_token = self.headers['iBaseToken']
+            result = self.do_call(url, data, method, filter_flag=filter_flag)
         error_code = result['error']['code']
         if (error_code == constants.ERROR_CONNECT_TO_SERVER
                 or error_code == constants.ERROR_UNAUTHORIZED_TO_SERVER):
             LOG.error(_LE("Can't open the recent url, relogin."))
-            device_id = self.login()
-
-        if device_id is not None:
-            LOG.debug('Replace URL: \n'
-                      'Old URL: %(old_url)s\n,'
-                      'New URL: %(new_url)s\n.',
-                      {'old_url': old_url,
-                       'new_url': self.url})
-            result = self.do_call(url, data, method)
-            if result['error']['code'] in constants.RELOGIN_ERROR_PASS:
-                result['error']['code'] = 0
+            with self.call_lock.write_lock():
+                relogin_result = self.relogin(old_token)
+            if relogin_result:
+                with self.call_lock.read_lock():
+                    result = self.do_call(url, data, method,
+                                          filter_flag=filter_flag)
+                if result['error']['code'] in constants.RELOGIN_ERROR_PASS:
+                    LOG.warning(_LW('This operation maybe '
+                                    'successed first time'))
+                    result['error']['code'] = 0
+                elif result['error']['code'] == 0:
+                    LOG.info(_LI('Successed in the second time.'))
+                else:
+                    LOG.info(_LI('Failed in the second time,'
+                                 'Reason: %s'), result)
+            else:
+                LOG.error(_LE('Relogin failed, no need to send again.'))
         return result
 
     def logout(self):
@@ -235,7 +271,13 @@ class RestClient(object):
         result = self.call(url, None, "GET")
         error_code = result['error']['code']
         if error_code != 0:
-            return False
+            if error_code == constants.ERROR_LUN_NOT_EXIST:
+                LOG.warning(_LW("Can't find LUN %s on the array."), lun_id)
+                return False
+            else:
+                msg = (_("Check LUN exist error."))
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
 
         if lun_wwn and result['data']['WWN'] != lun_wwn:
             LOG.debug("LUN ID %(id)s with WWN %(wwn)s does not exist on "
@@ -253,7 +295,7 @@ class RestClient(object):
 
     def get_all_pools(self):
         url = "/storagepool"
-        result = self.call(url, None)
+        result = self.call(url, None, "GET", filter_flag=True)
         msg = _('Query resource pool error.')
         self._assert_rest_result(result, msg)
         self._assert_data_in_result(result, msg)
@@ -265,15 +307,18 @@ class RestClient(object):
             return info
 
         for pool in pools:
-            if pool_name.strip() != pool['NAME']:
+            if pool_name.strip() != pool.get('NAME'):
                 continue
 
             if pool.get('USAGETYPE') == constants.FILE_SYSTEM_POOL_TYPE:
                 break
 
-            info['ID'] = pool['ID']
+            info['ID'] = pool.get('ID')
             info['CAPACITY'] = pool.get('DATASPACE', pool['USERFREECAPACITY'])
-            info['TOTALCAPACITY'] = pool['USERTOTALCAPACITY']
+            info['TOTALCAPACITY'] = pool.get('USERTOTALCAPACITY')
+            info['TIER0CAPACITY'] = pool.get('TIER0CAPACITY')
+            info['TIER1CAPACITY'] = pool.get('TIER1CAPACITY')
+            info['TIER2CAPACITY'] = pool.get('TIER2CAPACITY')
 
         return info
 
@@ -302,7 +347,10 @@ class RestClient(object):
                     return item['ID']
 
     def get_lun_id_by_name(self, name):
-        url = "/lun?range=[0-65535]"
+        if not name:
+            return
+
+        url = "/lun?filter=NAME::%s" % name
         result = self.call(url, None, "GET")
         self._assert_rest_result(result, _('Get lun id by name error.'))
 
@@ -310,7 +358,9 @@ class RestClient(object):
 
     def activate_snapshot(self, snapshot_id):
         url = "/snapshot/activate"
-        data = {"SNAPSHOTLIST": [snapshot_id]}
+        data = ({"SNAPSHOTLIST": snapshot_id}
+                if type(snapshot_id) in (list, tuple)
+                else {"SNAPSHOTLIST": [snapshot_id]})
         result = self.call(url, data)
         self._assert_rest_result(result, _('Activate snapshot error.'))
 
@@ -330,22 +380,30 @@ class RestClient(object):
         return result['data']
 
     def get_lun_id(self, volume, volume_name):
-        lun_id = (volume.get('provider_location') or
+        lun_id = (volume.provider_location or
                   self.get_lun_id_by_name(volume_name))
         if not lun_id:
             msg = (_("Can't find lun info on the array. "
                      "volume: %(id)s, lun name: %(name)s.") %
-                   {'id': volume['id'], 'name': volume_name})
+                   {'id': volume.id, 'name': volume_name})
             LOG.error(msg)
             raise exception.VolumeBackendAPIException(data=msg)
         return lun_id
 
-    def check_snapshot_exist(self, snapshot_id):
+    def check_snapshot_exist(self, snapshot_id, snapshot_wwn=None):
         url = "/snapshot/%s" % snapshot_id
         result = self.call(url, None, "GET")
         error_code = result['error']['code']
         if error_code != 0:
-            return False
+            if error_code == constants.ERROR_SNAPSHOT_NOT_EXIST:
+                return False
+            else:
+                msg = (_("Check snapshot exist error."))
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+        if snapshot_wwn:
+            if snapshot_wwn != result['data']['WWN']:
+                return False
 
         return True
 
@@ -362,7 +420,10 @@ class RestClient(object):
         self._assert_rest_result(result, _('Delete snapshot error.'))
 
     def get_snapshot_id_by_name(self, name):
-        url = "/snapshot?range=[0-32767]"
+        if not name:
+            return
+
+        url = "/snapshot?filter=NAME::%s" % name
         description = 'The snapshot license file is unavailable.'
         result = self.call(url, None, "GET")
         if 'error' in result:
@@ -372,13 +433,20 @@ class RestClient(object):
 
         return self._get_id_from_result(result, name, 'NAME')
 
-    def create_luncopy(self, luncopyname, srclunid, tgtlunid):
+    def create_luncopy(self, luncopyname, srclunid, tgtlunid, copyspeed):
         """Create a luncopy."""
         url = "/luncopy"
+        if copyspeed not in constants.LUN_COPY_SPEED_TYPES:
+            LOG.warning(_LW('The copy speed %(copyspeed)s is not valid, '
+                            'use default value %(default)s instead.'),
+                        {'copyspeed': copyspeed,
+                         'default': constants.LUN_COPY_SPEED_MEDIUM})
+            copyspeed = constants.LUN_COPY_SPEED_MEDIUM
+
         data = {"TYPE": 219,
                 "NAME": luncopyname,
                 "DESCRIPTION": luncopyname,
-                "COPYSPEED": 2,
+                "COPYSPEED": copyspeed,
                 "LUNCOPYTYPE": "1",
                 "SOURCELUN": ("INVALID;%s;INVALID;INVALID;INVALID"
                               % srclunid),
@@ -436,7 +504,8 @@ class RestClient(object):
             return True
         return False
 
-    def do_mapping(self, lun_id, hostgroup_id, host_id, portgroup_id=None):
+    def do_mapping(self, lun_id, hostgroup_id, host_id, portgroup_id=None,
+                   lun_type=constants.LUN_TYPE):
         """Add hostgroup and lungroup to mapping view."""
         lungroup_name = constants.LUNGROUP_PREFIX + host_id
         mapping_view_name = constants.MAPPING_VIEW_PREFIX + host_id
@@ -456,9 +525,10 @@ class RestClient(object):
             if lungroup_id is None:
                 lungroup_id = self._create_lungroup(lungroup_name)
             is_associated = self._is_lun_associated_to_lungroup(lungroup_id,
-                                                                lun_id)
+                                                                lun_id,
+                                                                lun_type)
             if not is_associated:
-                self.associate_lun_to_lungroup(lungroup_id, lun_id)
+                self.associate_lun_to_lungroup(lungroup_id, lun_id, lun_type)
 
             if view_id is None:
                 view_id = self._add_mapping_view(mapping_view_name)
@@ -490,7 +560,7 @@ class RestClient(object):
                 LOG.error(_LE(
                     'Error occurred when adding hostgroup and lungroup to '
                     'view. Remove lun from lungroup now.'))
-                self.remove_lun_from_lungroup(lungroup_id, lun_id)
+                self.remove_lun_from_lungroup(lungroup_id, lun_id, lun_type)
 
         return map_info
 
@@ -510,16 +580,6 @@ class RestClient(object):
         if not self.is_initiator_associated_to_host(initiator_name, host_id):
             self._associate_initiator_to_host(initiator_name,
                                               host_id)
-
-    def _get_iscsi_tgt_port(self):
-        url = "/iscsidevicename"
-        result = self.call(url, None)
-
-        msg = _('Get iSCSI target port error.')
-        self._assert_rest_result(result, msg)
-        self._assert_data_in_result(result, msg)
-
-        return result['data'][0]['CMO_ISCSI_DEVICE_NAME']
 
     def find_hostgroup(self, groupname):
         """Get the given hostgroup id."""
@@ -624,9 +684,10 @@ class RestClient(object):
             return True
         return False
 
-    def get_host_lun_id(self, host_id, lun_id):
-        url = ("/lun/associate?TYPE=11&ASSOCIATEOBJTYPE=21"
-               "&ASSOCIATEOBJID=%s" % (host_id))
+    def get_host_lun_id(self, host_id, lun_id, lun_type=constants.LUN_TYPE):
+        cmd_type = 'lun' if lun_type == constants.LUN_TYPE else 'snapshot'
+        url = ("/%s/associate?TYPE=%s&ASSOCIATEOBJTYPE=21"
+               "&ASSOCIATEOBJID=%s" % (cmd_type, lun_type, host_id))
         result = self.call(url, None, "GET")
         self._assert_rest_result(result, _('Find host lun id error.'))
 
@@ -714,10 +775,13 @@ class RestClient(object):
 
         return False
 
-    def _is_lun_associated_to_lungroup(self, lungroup_id, lun_id):
+    def _is_lun_associated_to_lungroup(self, lungroup_id, lun_id,
+                                       lun_type=constants.LUN_TYPE):
         """Check whether the lun is associated to the lungroup."""
-        url = ("/lun/associate?TYPE=11&"
-               "ASSOCIATEOBJTYPE=256&ASSOCIATEOBJID=%s" % lungroup_id)
+        cmd_type = 'lun' if lun_type == constants.LUN_TYPE else 'snapshot'
+        url = ("/%s/associate?TYPE=%s&"
+               "ASSOCIATEOBJTYPE=256&ASSOCIATEOBJID=%s"
+               % (cmd_type, lun_type, lungroup_id))
 
         result = self.call(url, None, "GET")
         self._assert_rest_result(result, _('Check lungroup associate error.'))
@@ -738,19 +802,21 @@ class RestClient(object):
         self._assert_rest_result(result, _('Associate host to hostgroup '
                                  'error.'))
 
-    def associate_lun_to_lungroup(self, lungroup_id, lun_id):
+    def associate_lun_to_lungroup(self, lungroup_id, lun_id,
+                                  lun_type=constants.LUN_TYPE):
         """Associate lun to lungroup."""
         url = "/lungroup/associate"
         data = {"ID": lungroup_id,
-                "ASSOCIATEOBJTYPE": "11",
+                "ASSOCIATEOBJTYPE": lun_type,
                 "ASSOCIATEOBJID": lun_id}
         result = self.call(url, data)
         self._assert_rest_result(result, _('Associate lun to lungroup error.'))
 
-    def remove_lun_from_lungroup(self, lungroup_id, lun_id):
+    def remove_lun_from_lungroup(self, lungroup_id, lun_id,
+                                 lun_type=constants.LUN_TYPE):
         """Remove lun from lungroup."""
-        url = ("/lungroup/associate?ID=%s&ASSOCIATEOBJTYPE=11"
-               "&ASSOCIATEOBJID=%s" % (lungroup_id, lun_id))
+        url = ("/lungroup/associate?ID=%s&ASSOCIATEOBJTYPE=%s"
+               "&ASSOCIATEOBJID=%s" % (lungroup_id, lun_type, lun_id))
 
         result = self.call(url, None, 'DELETE')
         self._assert_rest_result(
@@ -880,7 +946,7 @@ class RestClient(object):
                 "ID": initiator_name,
                 "PARENTTYPE": "21",
                 "PARENTID": host_id}
-        result = self.call(url, data, "PUT")
+        result = self.call(url, data, "PUT", filter_flag=True)
         msg = _('Use CHAP to associate initiator to host error. '
                 'Please check the CHAP username and password.')
         self._assert_rest_result(result, msg)
@@ -989,16 +1055,25 @@ class RestClient(object):
         result = self.call(url, None, "DELETE")
         self._assert_rest_result(result, _('Delete mapping view error.'))
 
-    def get_lunnum_from_lungroup(self, lungroup_id):
-        """Check if there are still other luns associated to the lungroup."""
+    def get_obj_count_from_lungroup(self, lungroup_id):
+        """Get all objects count associated to the lungroup."""
+        lun_count = self._get_obj_count_from_lungroup_by_type(
+            lungroup_id, constants.LUN_TYPE)
+        snapshot_count = self._get_obj_count_from_lungroup_by_type(
+            lungroup_id, constants.SNAPSHOT_TYPE)
+        return int(lun_count) + int(snapshot_count)
+
+    def _get_obj_count_from_lungroup_by_type(self, lungroup_id,
+                                             lun_type=constants.LUN_TYPE):
+        cmd_type = 'lun' if lun_type == constants.LUN_TYPE else 'snapshot'
         lunnum = 0
         if not lungroup_id:
             return lunnum
 
-        url = ("/lun/count?TYPE=11&ASSOCIATEOBJTYPE=256&"
-               "ASSOCIATEOBJID=%s" % lungroup_id)
+        url = ("/%s/count?TYPE=%s&ASSOCIATEOBJTYPE=256&"
+               "ASSOCIATEOBJID=%s" % (cmd_type, lun_type, lungroup_id))
         result = self.call(url, None, "GET")
-        self._assert_rest_result(result, _('Find lun number error.'))
+        self._assert_rest_result(result, _('Find obj number error.'))
         if 'data' in result:
             lunnum = int(result['data']['COUNT'])
         return lunnum
@@ -1051,6 +1126,22 @@ class RestClient(object):
 
         return pool_capacity
 
+    def _get_disk_type(self, pool_name, result):
+        """Get disk type of the pool."""
+        pool_info = self.get_pool_info(pool_name, result)
+        if not pool_info:
+            return None
+
+        pool_disk = []
+        for i, x in enumerate(['ssd', 'sas', 'nl_sas']):
+            if pool_info['TIER%dCAPACITY' % i] != '0':
+                pool_disk.append(x)
+
+        if len(pool_disk) > 1:
+            pool_disk = ['mix']
+
+        return pool_disk[0] if pool_disk else None
+
     def get_luncopy_info(self, luncopy_id):
         """Get LUNcopy information."""
         url = "/LUNCOPY?range=[0-1023]"
@@ -1087,6 +1178,14 @@ class RestClient(object):
                 if tgtwwpn not in tgt_port_wwns:
                     tgt_port_wwns.append(tgtwwpn)
 
+        if not tgt_port_wwns:
+            err_msg = (_('Get FC target wwpns error, tgt_port_wwns: '
+                         '%(tgt_port_wwns)s, init_targ_map: %(init_targ_map)s')
+                       % {'tgt_port_wwns': tgt_port_wwns,
+                          'init_targ_map': init_targ_map})
+            LOG.error(err_msg)
+            raise exception.VolumeBackendAPIException(data=err_msg)
+
         return (tgt_port_wwns, init_targ_map)
 
     def get_online_free_wwns(self):
@@ -1118,55 +1217,6 @@ class RestClient(object):
         result = self.call(url, data, "PUT")
         self._assert_rest_result(result, _('Add FC port to host error.'))
 
-    def _get_iscsi_port_info(self, ip):
-        """Get iscsi port info in order to build the iscsi target iqn."""
-        url = "/eth_port"
-        result = self.call(url, None, "GET")
-
-        msg = _('Get iSCSI port information error.')
-        self._assert_rest_result(result, msg)
-        self._assert_data_in_result(result, msg)
-
-        iscsi_port_info = None
-        for item in result['data']:
-            if ip == item['IPV4ADDR']:
-                iscsi_port_info = item['LOCATION']
-                break
-
-        return iscsi_port_info
-
-    def _get_tgt_iqn(self, iscsi_ip):
-        """Get target iSCSI iqn."""
-        ip_info = self._get_iscsi_port_info(iscsi_ip)
-        iqn_prefix = self._get_iscsi_tgt_port()
-        if not ip_info:
-            err_msg = (_(
-                'Get iSCSI port info error, please check the target IP '
-                'configured in huawei conf file.'))
-            LOG.error(err_msg)
-            raise exception.VolumeBackendAPIException(data=err_msg)
-
-        LOG.debug('Request ip info is: %s.', ip_info)
-        split_list = ip_info.split(".")
-        newstr = split_list[1] + split_list[2]
-        LOG.info(_LI('New str info is: %s.'), newstr)
-
-        if ip_info:
-            if newstr[0] == 'A':
-                ctr = "0"
-            elif newstr[0] == 'B':
-                ctr = "1"
-            interface = '0' + newstr[1]
-            port = '0' + newstr[3]
-            iqn_suffix = ctr + '02' + interface + port
-            for i in range(0, len(iqn_suffix)):
-                if iqn_suffix[i] != '0':
-                    iqn_suffix = iqn_suffix[i:]
-                    break
-            iqn = iqn_prefix + ':' + iqn_suffix + ':' + iscsi_ip
-            LOG.info(_LI('_get_tgt_iqn: iSCSI target iqn is: %s.'), iqn)
-            return iqn
-
     def get_fc_target_wwpns(self, wwn):
         url = ("/host_link?INITIATOR_TYPE=223&INITIATOR_PORT_WWN=" + wwn)
         result = self.call(url, None, "GET")
@@ -1188,6 +1238,7 @@ class RestClient(object):
         result = self.get_all_pools()
         for pool_name in self.storage_pools:
             capacity = self._get_capacity(pool_name, result)
+            disk_type = self._get_disk_type(pool_name, result)
             pool = {}
             pool.update(dict(
                 location_info=self.device_id,
@@ -1196,36 +1247,14 @@ class RestClient(object):
                 free_capacity_gb=capacity['free_capacity'],
                 reserved_percentage=self.configuration.safe_get(
                     'reserved_percentage'),
-                QoS_support=True,
                 max_over_subscription_ratio=self.configuration.safe_get(
                     'max_over_subscription_ratio'),
-                thin_provisioning_support=True,
-                thick_provisioning_support=True,
-                smarttier=True,
-                smartcache=True,
-                smartpartition=True,
             ))
+            if disk_type:
+                pool['disk_type'] = disk_type
+
             data['pools'].append(pool)
         return data
-
-    def _find_qos_policy_info(self, policy_name):
-        url = "/ioclass"
-        result = self.call(url, None, "GET")
-
-        msg = _('Get QoS policy error.')
-        self._assert_rest_result(result, msg)
-
-        qos_info = {}
-        if 'data' in result:
-            for item in result['data']:
-                if policy_name == item['NAME']:
-                    qos_info['ID'] = item['ID']
-                    lun_list = json.loads(item['LUNLIST'])
-                    qos_info['LUNLIST'] = lun_list
-                    qos_info['RUNNINGSTATUS'] = item['RUNNINGSTATUS']
-                    break
-
-        return qos_info
 
     def _update_qos_policy_lunlist(self, lun_list, policy_id):
         url = "/ioclass/" + policy_id
@@ -1248,34 +1277,96 @@ class RestClient(object):
 
         if 'data' in result:
             for item in result['data']:
-                if (item['IPV4ADDR']
+                if ((item['IPV4ADDR'] or item['IPV6ADDR'])
                    and item['HEALTHSTATUS'] == constants.STATUS_HEALTH
                    and item['RUNNINGSTATUS'] == constants.STATUS_RUNNING):
-                    target_ip = item['IPV4ADDR']
-                    LOG.info(_LI('_get_tgt_ip_from_portgroup: Get ip: %s.'),
-                             target_ip)
-                    target_ips.append(target_ip)
+                    if item['IPV4ADDR']:
+                        target_ips.append(item['IPV4ADDR'])
+                    if item['IPV6ADDR']:
+                        target_ips.append(item['IPV6ADDR'])
+        LOG.info(_LI('_get_tgt_ip_from_portgroup: Get ip: %s.'),
+                 target_ips)
 
         return target_ips
 
     def get_iscsi_params(self, connector):
         """Get target iSCSI params, including iqn, IP."""
         initiator = connector['initiator']
+        multipath = connector.get('multipath', False)
         target_ips = []
         target_iqns = []
+        temp_tgt_ips = []
         portgroup = None
         portgroup_id = None
+
         for ini in self.iscsi_info:
             if ini['Name'] == initiator:
-                for key in ini:
-                    if key == 'TargetPortGroup':
-                        portgroup = ini['TargetPortGroup']
-                    elif key == 'TargetIP':
-                        target_ips.append(ini['TargetIP'])
+                portgroup = ini.get('TargetPortGroup')
 
         if portgroup:
             portgroup_id = self.get_tgt_port_group(portgroup)
-            target_ips = self._get_tgt_ip_from_portgroup(portgroup_id)
+            tgt_ips = self._get_tgt_ip_from_portgroup(portgroup_id)
+            temp_tgt_ips = self.convert_ip_to_normalized_format(tgt_ips)
+            port_ips = self._get_tgt_port_ip_from_rest()
+            valid_tgt_ips = self.convert_ip_to_normalized_format(port_ips)
+
+            for ip in temp_tgt_ips:
+                if ip in valid_tgt_ips:
+                    target_ips.append(ip)
+
+            if not target_ips and multipath:
+                msg = (_(
+                    'get_iscsi_params: No valid port in portgroup. '
+                    'portgroup_id: %(id)s, please check it on storage.')
+                    % {'id': portgroup_id})
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+
+        if not target_ips:
+            target_ips = self._get_target_ip(initiator)
+
+        # Deal with the remote tgt ip.
+        if 'remote_target_ip' in connector:
+            target_ips.append(connector['remote_target_ip'])
+        LOG.info(_LI('Get the default ip: %s.'), target_ips)
+        target_ips = self.convert_ip_to_normalized_format(target_ips)
+
+        for ip in target_ips:
+            target_iqn = self._get_tgt_iqn_from_rest(ip)
+            if target_iqn:
+                target_iqns.append(target_iqn)
+
+        if not target_iqns:
+            err_msg = (_(
+                'Get iSCSI target iqn error, please check the target IP '
+                'configured on array.'))
+            LOG.error(err_msg)
+            raise exception.VolumeBackendAPIException(data=err_msg)
+
+        target_ips = []
+        for iqn in target_iqns:
+            ip = iqn.split(':', 5)[5]
+            if netaddr.IPAddress(ip).version == 6:
+                ip = '[' + ip + ']'
+            target_ips.append(ip)
+
+        return (target_iqns, target_ips, portgroup_id)
+
+    def convert_ip_to_normalized_format(self, target_ips):
+        format_ips = []
+        for ip in target_ips:
+            format_ip = netaddr.IPAddress(ip)
+            if format_ip.version == 6:
+                ip = str(format_ip.format(dialect=netaddr.ipv6_compact))
+            format_ips.append(ip)
+        return format_ips
+
+    def _get_target_ip(self, initiator):
+        target_ips = []
+        for ini in self.iscsi_info:
+            if ini['Name'] == initiator:
+                if ini.get('TargetIP'):
+                    target_ips.append(ini.get('TargetIP'))
 
         # If not specify target IP for some initiators, use default IP.
         if not target_ips:
@@ -1289,20 +1380,38 @@ class RestClient(object):
                     'for initiator %(ini)s, please check config file.')
                     % {'ini': initiator})
                 LOG.error(msg)
-                raise exception.InvalidInput(reason=msg)
+                raise exception.VolumeBackendAPIException(data=msg)
 
-        # Deal with the remote tgt ip.
-        if 'remote_target_ip' in connector:
-            target_ips.append(connector['remote_target_ip'])
-        LOG.info(_LI('Get the default ip: %s.'), target_ips)
-        for ip in target_ips:
-            target_iqn = self._get_tgt_iqn_from_rest(ip)
-            if not target_iqn:
-                target_iqn = self._get_tgt_iqn(ip)
-            if target_iqn:
-                target_iqns.append(target_iqn)
+        return target_ips
 
-        return (target_iqns, target_ips, portgroup_id)
+    def _get_tgt_port_ip_from_rest(self):
+        url = "/iscsi_tgt_port"
+        result = self.call(url, None, "GET")
+        info_list = []
+        target_ips = []
+        if result['error']['code'] != 0:
+            LOG.warning(_LW("Can't find target port info from rest."))
+            return target_ips
+
+        elif not result['data']:
+            msg = (_(
+                "Can't find valid IP from rest, please check it on storage."))
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data = msg)
+
+        if 'data' in result:
+            for item in result['data']:
+                info_list.append(item['ID'])
+
+        if not info_list:
+            LOG.warning(_LW("Can't find target port info from rest."))
+            return target_ips
+
+        for info in info_list:
+            iqn_info = info.split(',', 1)[0]
+            target_ip = iqn_info.split(':', 5)[5]
+            target_ips.append(target_ip)
+        return target_ips
 
     def _get_tgt_iqn_from_rest(self, target_ip):
         url = "/iscsi_tgt_port"
@@ -1312,14 +1421,17 @@ class RestClient(object):
         if result['error']['code'] != 0:
             LOG.warning(_LW("Can't find target iqn from rest."))
             return target_iqn
-        ip_pattern = re.compile(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}')
+
         if 'data' in result:
             for item in result['data']:
-                ips = re.findall(ip_pattern, item['ID'])
-                for ip in ips:
-                    if target_ip == ip:
-                        target_iqn = item['ID']
-                        break
+                iqn_info = item['ID'].split(',', 1)[0]
+                ip = iqn_info.split(':', 5)[5]
+                format_ip = netaddr.IPAddress(ip)
+                if format_ip.version == 6:
+                    ip = str(format_ip.format(dialect=netaddr.ipv6_compact))
+                if target_ip == ip:
+                    target_iqn = item['ID']
+                    break
 
         if not target_iqn:
             LOG.warning(_LW("Can't find target iqn from rest."))
@@ -1440,10 +1552,10 @@ class RestClient(object):
 
         return result['data']['IOCLASSID']
 
-    def get_lungroupids_by_lunid(self, lun_id):
+    def get_lungroupids_by_lunid(self, lun_id, lun_type=constants.LUN_TYPE):
         """Get lungroup ids by lun id."""
         url = ("/lungroup/associate?TYPE=256"
-               "&ASSOCIATEOBJTYPE=11&ASSOCIATEOBJID=%s" % lun_id)
+               "&ASSOCIATEOBJTYPE=%s&ASSOCIATEOBJID=%s" % (lun_type, lun_id))
 
         result = self.call(url, None, "GET")
         self._assert_rest_result(result, _('Get lungroup id by lun id error.'))
@@ -1455,8 +1567,9 @@ class RestClient(object):
 
         return lungroup_ids
 
-    def get_lun_info(self, lun_id):
-        url = "/lun/" + lun_id
+    def get_lun_info(self, lun_id, lun_type = constants.LUN_TYPE):
+        cmd_type = 'lun' if lun_type == constants.LUN_TYPE else 'snapshot'
+        url = ("/%s/%s" % (cmd_type, lun_id))
         result = self.call(url, None, "GET")
 
         msg = _('Get volume error.')
@@ -1590,7 +1703,7 @@ class RestClient(object):
                 qos_flag = 0
                 extra_flag = False
                 if 'LATENCY' not in qos and items['LATENCY'] != '0':
-                        extra_flag = True
+                    extra_flag = True
                 else:
                     for item in items:
                         if item in extra_qos:
@@ -1652,7 +1765,7 @@ class RestClient(object):
 
     def get_array_info(self):
         url = "/system/"
-        result = self.call(url, None, "GET")
+        result = self.call(url, None, "GET", filter_flag=True)
         self._assert_rest_result(result, _('Get array info error.'))
         return result.get('data', None)
 
@@ -1777,8 +1890,13 @@ class RestClient(object):
         result = self.call(url, None, "GET")
         error_code = result['error']['code']
         if error_code != 0:
-            return False
-
+            if error_code == constants.FC_INITIATOR_NOT_EXIST:
+                return False
+            msg = (_('Get fc initiator %(initiator)s on array error. '
+                     'result: %(res)s.') % {'initiator': ininame,
+                                            'res': result})
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
         return True
 
     def _add_fc_initiator_to_array(self, ininame):
@@ -1803,6 +1921,19 @@ class RestClient(object):
         self._assert_rest_result(result, msg)
 
         return result['data']
+
+    def get_fc_initiator_on_array(self):
+        url = '/fc_initiator'
+        result = self.call(url, None, "GET")
+        msg = _('Get FC initiators from array error.')
+        self._assert_rest_result(result, msg)
+
+        fc_initiators = []
+        if 'data' in result:
+            for item in result['data']:
+                fc_initiators.append(item['ID'])
+
+        return fc_initiators
 
     def get_fc_ports_from_contr(self, contr):
         port_list_from_contr = []
@@ -1838,6 +1969,7 @@ class RestClient(object):
         self._assert_data_in_result(result, msg)
         return result['data']
 
+    @utils.synchronized('huawei_delete_hypermetro_pair', external=True)
     def delete_hypermetro(self, metro_id):
         url = "/HyperMetroPair/" + metro_id
         result = self.call(url, None, "DELETE")
@@ -1893,8 +2025,12 @@ class RestClient(object):
             raise exception.VolumeBackendAPIException(data=msg)
 
         if error_code != 0:
-            return False
-
+            if error_code == constants.HYPERMETROPAIR_NOT_EXIST:
+                return False
+            msg = (_("check_hypermetro_exist error.\nresult: %(res)s.")
+                   % {'res': result})
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
         return True
 
     def change_hostlun_id(self, map_info, hostlun_id):
@@ -2165,8 +2301,19 @@ class RestClient(object):
                 "ID": portg_id,
                 "TYPE": 257}
         result = self.call(url, data, "PUT")
-        self._assert_rest_result(result, _('Append port group description'
-                                           ' error.'))
+        self._assert_rest_result(result, _('Append port group description '
+                                           'error.'))
+
+    def update_obj_desc(self, lun_id, description,
+                        lun_type=constants.LUN_TYPE):
+        cmd_type = 'lun' if lun_type == constants.LUN_TYPE else 'snapshot'
+        url = ("/%s/%s" % (cmd_type, lun_id))
+        data = {"DESCRIPTION": description,
+                "ID": lun_id,
+                "TYPE": lun_type}
+        result = self.call(url, data, "PUT")
+        self._assert_rest_result(result, _('update object description '
+                                           'error.'))
 
     def get_ports_by_portg(self, portg_id):
         wwns = []
@@ -2182,7 +2329,7 @@ class RestClient(object):
 
     def get_remote_devices(self):
         url = "/remote_device"
-        result = self.call(url, None, "GET")
+        result = self.call(url, None, "GET", filter_flag=True)
         self._assert_rest_result(result, _('Get remote devices error.'))
         return result.get('data', [])
 
@@ -2244,7 +2391,15 @@ class RestClient(object):
     def check_pair_exist(self, pair_id):
         url = "/REPLICATIONPAIR/" + pair_id
         result = self.call(url, None, "GET")
-        return result['error']['code'] == 0
+        error_code = result['error']['code']
+        if error_code != 0:
+            if error_code == constants.REPLICATIONPAIR_NOT_EXIST:
+                return False
+            msg = (_("Check replication pair exist error.\nresult: %(res)s.")
+                   % {'res': result})
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+        return True
 
     def set_pair_second_access(self, pair_id, access):
         url = "/REPLICATIONPAIR/" + pair_id
@@ -2262,3 +2417,13 @@ class RestClient(object):
         if data is not None:
             return data.get('ISADD2HOSTGROUP') == 'true'
         return False
+
+    def _get_object_count(self, obj_name):
+        url = "/" + obj_name + "/count"
+        result = self.call(url, None, "GET", filter_flag=True)
+
+        if result['error']['code'] != 0:
+            raise
+
+        if result.get("data"):
+            return result.get("data").get("COUNT")
