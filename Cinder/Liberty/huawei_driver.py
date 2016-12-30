@@ -2109,7 +2109,7 @@ class HuaweiISCSIDriver(HuaweiBaseDriver, driver.ISCSIDriver):
 
         lun_id, lun_type = self.get_lun_id_and_type(
             volume, constants.VOLUME_NOT_EXISTS_RAISE, local)
-        lun_info = client.get_lun_info(lun_id)
+        lun_info = client.get_lun_info(lun_id, lun_type)
 
         initiator_name = connector['initiator']
         LOG.info(_LI(
@@ -2336,7 +2336,7 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
     def initialize_connection(self, volume, connector):
         lun_id, lun_type = self.get_lun_id_and_type(
             volume, constants.VOLUME_NOT_EXISTS_RAISE)
-        lun_info = self.client.get_lun_info(lun_id)
+        lun_info = self.client.get_lun_info(lun_id, lun_type)
 
         wwns = connector['wwpns']
         LOG.info(_LI(
