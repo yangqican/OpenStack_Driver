@@ -316,7 +316,6 @@ class HuaweiBaseDriver(driver.VolumeDriver):
             'ALLOCTYPE': opts.get('LUNType', self.configuration.lun_type),
             'CAPACITY': huawei_utils.get_volume_size(volume),
             'WRITEPOLICY': self.configuration.lun_write_type,
-            'MIRRORPOLICY': self.configuration.lun_mirror_switch,
             'PREFETCHPOLICY': self.configuration.lun_prefetch_type,
             'PREFETCHVALUE': self.configuration.lun_prefetch_value,
             'DATATRANSFERPOLICY':
@@ -668,9 +667,12 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
         lun_info = self.client.get_lun_info(src_id)
 
-        policy = lun_info['DATATRANSFERPOLICY']
         if opts['policy']:
             policy = opts['policy']
+        else:
+            policy = lun_info.get('DATATRANSFERPOLICY',
+                                  self.configuration.lun_policy)
+
         lun_params = {
             'NAME': dst_volume_name,
             'PARENTID': pool_info['ID'],
@@ -678,12 +680,15 @@ class HuaweiBaseDriver(driver.VolumeDriver):
             'ALLOCTYPE': opts.get('LUNType', lun_info['ALLOCTYPE']),
             'CAPACITY': lun_info['CAPACITY'],
             'WRITEPOLICY': lun_info['WRITEPOLICY'],
-            'MIRRORPOLICY': lun_info['MIRRORPOLICY'],
             'PREFETCHPOLICY': lun_info['PREFETCHPOLICY'],
             'PREFETCHVALUE': lun_info['PREFETCHVALUE'],
             'DATATRANSFERPOLICY': policy,
-            'READCACHEPOLICY': lun_info['READCACHEPOLICY'],
-            'WRITECACHEPOLICY': lun_info['WRITECACHEPOLICY'],
+            'READCACHEPOLICY': lun_info.get(
+                'READCACHEPOLICY',
+                self.configuration.lun_read_cache_policy),
+            'WRITECACHEPOLICY': lun_info.get(
+                'WRITECACHEPOLICY',
+                self.configuration.lun_write_cache_policy),
             'OWNINGCONTROLLER': lun_info['OWNINGCONTROLLER'], }
 
         for item in lun_params.keys():
@@ -907,6 +912,24 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                                                     snapshot_name,
                                                     snapshot_description)
         snapshot_id = snapshot_info['ID']
+
+        def _snapshot_ready():
+            result = self.client.get_snapshot_info(snapshot_id)
+            if result['HEALTHSTATUS'] != constants.STATUS_HEALTH:
+                err_msg = _("The snapshot created is fault.")
+                LOG.error(err_msg)
+                raise exception.VolumeBackendAPIException(data=err_msg)
+
+            if (result['RUNNINGSTATUS'] ==
+                    constants.STATUS_SNAPSHOT_INACTIVE):
+                return True
+
+            return False
+
+        huawei_utils.wait_for_condition(_snapshot_ready,
+                                        constants.DEFAULT_WAIT_INTERVAL,
+                                        constants.DEFAULT_WAIT_INTERVAL * 10)
+
         try:
             self.client.activate_snapshot(snapshot_id)
         except Exception:
@@ -915,8 +938,11 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                           snapshot_id)
                 self.client.delete_snapshot(snapshot_id)
 
-        metadata = {'huawei_snapshot_wwn': snapshot_info['WWN']}
-        return {'provider_location': snapshot_info['ID'],
+        snapshot_info = self.client.get_snapshot_info(snapshot_id)
+
+        metadata = huawei_utils.get_snapshot_metadata_value(snapshot)
+        metadata.update({'huawei_snapshot_wwn': snapshot_info['WWN']})
+        return {'provider_location': snapshot_id,
                 'lun_info': snapshot_info,
                 'metadata': metadata}
 
@@ -1306,6 +1332,10 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
             def _luncopy_complete():
                 luncopy_info = self.client.get_luncopy_info(luncopy_id)
+                if not luncopy_info:
+                    msg = (_("Failed to get luncopy %s by luncopy id.")
+                           % luncopy_id)
+                    raise exception.VolumeBackendAPIException(data=msg)
                 if luncopy_info['status'] == constants.STATUS_LUNCOPY_READY:
                     # luncopy_info['status'] means for the running status of
                     # the luncopy. If luncopy_info['status'] is equal to '40',
@@ -1468,7 +1498,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
             new_opts = self._get_volume_params_from_specs(new_specs)
             if ('LUNType' in new_opts and
                     old_opts['LUNType'] != new_opts['LUNType']):
-                msg = (_("Can't import LUN %(lun_id)s to Cinder. "
+                msg = (_("Can't import LUN %s to Cinder. "
                          "LUN type mismatched.") % lun_id)
                 raise exception.ManageExistingVolumeTypeMismatch(reason=msg)
             if volume_type:

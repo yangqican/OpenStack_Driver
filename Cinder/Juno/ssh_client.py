@@ -561,8 +561,7 @@ class TseriesClient(object):
 
         # If write type is "write through", no need to set mirror switch.
         if params['WriteType'] != '2':
-            cli_cmd = cli_cmd + ('-mirrorsw %(mirrorsw)s '
-                                 % {'mirrorsw': params['MirrorSwitch']})
+            cli_cmd = cli_cmd + '-mirrorsw 1 '
 
         # Differences exist between "Thin" and "thick" LUN in CLI commands.
         luntype = params['LUNType']
@@ -640,7 +639,6 @@ class TseriesClient(object):
         conf_params = {'LUNType': 'Thin',
                        'StripUnitSize': '64',
                        'WriteType': '1',
-                       'MirrorSwitch': '1',
                        'PrefetchType': '3',
                        'PrefetchValue': '0',
                        'PrefetchTimes': '0',
@@ -654,9 +652,6 @@ class TseriesClient(object):
         writetype = root.findtext('LUN/WriteType')
         if writetype:
             conf_params['WriteType'] = writetype.strip()
-        mirrorswitch = root.findtext('LUN/MirrorSwitch')
-        if mirrorswitch:
-            conf_params['MirrorSwitch'] = mirrorswitch.strip()
         prefetch = root.find('LUN/Prefetch')
         if prefetch is not None and prefetch.attrib['Type']:
             conf_params['PrefetchType'] = prefetch.attrib['Type'].strip()

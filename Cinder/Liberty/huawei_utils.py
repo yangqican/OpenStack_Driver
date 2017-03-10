@@ -22,6 +22,7 @@ import six
 
 from cinder import exception
 from cinder.i18n import _
+from cinder import objects
 from cinder.volume.drivers.huawei import constants
 
 LOG = logging.getLogger(__name__)
@@ -79,6 +80,9 @@ def get_volume_size(volume):
 
 
 def get_volume_metadata(volume):
+    if type(volume) is objects.Volume:
+        return volume.metadata
+
     if 'volume_metadata' in volume:
         metadata = volume.get('volume_metadata')
         return {item['key']: item['value'] for item in metadata}
@@ -100,6 +104,9 @@ def get_admin_metadata(volume):
 
 
 def get_snapshot_metadata_value(snapshot):
+    if type(snapshot) is objects.Snapshot:
+        return snapshot.metadata
+
     if 'snapshot_metadata' in snapshot:
         metadata = snapshot.snapshot_metadata
         return {item['key']: item['value'] for item in metadata}

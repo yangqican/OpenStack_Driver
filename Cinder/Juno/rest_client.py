@@ -254,6 +254,8 @@ class RestClient(object):
             raise exception.VolumeBackendAPIException(data=err_msg)
 
     def create_lun(self, lun_params):
+        # Set the mirror switch always on
+        lun_params['MIRRORPOLICY'] = '1'
         url = "/lun"
         result = self.call(url, lun_params)
         if result['error']['code'] == constants.ERROR_VOLUME_ALREADY_EXIST:
@@ -1145,19 +1147,16 @@ class RestClient(object):
 
     def get_luncopy_info(self, luncopy_id):
         """Get LUNcopy information."""
-        url = "/LUNCOPY?range=[0-1023]"
+        url = "/LUNCOPY/%s" % luncopy_id
         result = self.call(url, None, "GET")
         self._assert_rest_result(result, _('Get LUNcopy information error.'))
 
         luncopyinfo = {}
         if 'data' in result:
-            for item in result['data']:
-                if luncopy_id == item['ID']:
-                    luncopyinfo['name'] = item['NAME']
-                    luncopyinfo['id'] = item['ID']
-                    luncopyinfo['state'] = item['HEALTHSTATUS']
-                    luncopyinfo['status'] = item['RUNNINGSTATUS']
-                    break
+            luncopyinfo['name'] = result['data']['NAME']
+            luncopyinfo['id'] = result['data']['ID']
+            luncopyinfo['state'] = result['data']['HEALTHSTATUS']
+            luncopyinfo['status'] = result['data']['RUNNINGSTATUS']
         return luncopyinfo
 
     def delete_luncopy(self, luncopy_id):
@@ -1923,16 +1922,34 @@ class RestClient(object):
 
         return result['data']
 
-    def get_fc_initiator_on_array(self):
-        url = '/fc_initiator'
+    def get_fc_initiator_count(self):
+        url = '/fc_initiator/count'
         result = self.call(url, None, "GET")
-        msg = _('Get FC initiators from array error.')
+
+        msg = _('Get fc initiator count error.')
         self._assert_rest_result(result, msg)
+        self._assert_data_in_result(result, msg)
+
+        return int(result['data']['COUNT'])
+
+    def get_fc_initiator_on_array(self):
+        count = self.get_fc_initiator_count()
+        if count <= 0:
+            return []
 
         fc_initiators = []
-        if 'data' in result:
-            for item in result['data']:
-                fc_initiators.append(item['ID'])
+        for i in range((count - 1) / constants.MAX_QUERY_COUNT + 1):
+            url = '/fc_initiator?range=[%d-%d]' % (
+                i * constants.MAX_QUERY_COUNT,
+                (i + 1) * constants.MAX_QUERY_COUNT)
+            result = self.call(url, None, "GET")
+
+            msg = _('Get FC initiators from array error.')
+            self._assert_rest_result(result, msg)
+
+            if 'data' in result:
+                for item in result['data']:
+                    fc_initiators.append(item['ID'])
 
         return fc_initiators
 

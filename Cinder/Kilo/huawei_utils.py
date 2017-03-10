@@ -21,6 +21,7 @@ import six
 
 from cinder import exception
 from cinder.i18n import _
+from cinder import objects
 from cinder.openstack.common import loopingcall
 from cinder.volume.drivers.huawei import constants
 
@@ -100,6 +101,9 @@ def get_admin_metadata(volume):
 
 
 def get_snapshot_metadata_value(snapshot):
+    if type(snapshot) is objects.Snapshot:
+        return snapshot.metadata
+
     if 'snapshot_metadata' in snapshot:
         metadata = snapshot.snapshot_metadata
         return dict((item['key'], item['value']) for item in metadata)
