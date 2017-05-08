@@ -15,6 +15,7 @@
 
 import json
 import netaddr
+import six
 import socket
 import ssl
 import threading
@@ -22,7 +23,6 @@ import time
 import urllib2
 
 from oslo.utils import excutils
-import six
 from six.moves import http_cookiejar
 from six.moves import urllib
 
@@ -1255,6 +1255,22 @@ class RestClient(object):
 
             data['pools'].append(pool)
         return data
+
+    def check_storage_pools(self):
+        result = self.get_all_pools()
+        s_pools = []
+        for pool in result:
+            if 'USAGETYPE' in pool:
+                if pool['USAGETYPE'] == constants.BLOCK_STORAGE_POOL_TYPE:
+                    s_pools.append(pool['NAME'])
+            else:
+                s_pools.append(pool['NAME'])
+        for pool_name in self.storage_pools:
+            if pool_name not in s_pools:
+                err_msg = (_('Block storage pool %s does not exist on '
+                             'the array.') % pool_name)
+                LOG.error(err_msg)
+                raise exception.VolumeBackendAPIException(data=err_msg)
 
     def _update_qos_policy_lunlist(self, lun_list, policy_id):
         url = "/ioclass/" + policy_id

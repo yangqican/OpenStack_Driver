@@ -15,11 +15,11 @@
 
 import collections
 import contextlib
+import six
 import threading
 import time
 
 from oslo.utils import units
-import six
 
 from cinder import exception
 from cinder.i18n import _

@@ -15,18 +15,14 @@
 
 import json
 import netaddr
-import socket
-import ssl
+import requests
+import six
 import threading
 import time
-import urllib2
 
 from oslo_concurrency import lockutils
 from oslo_log import log as logging
 from oslo_utils import excutils
-import six
-from six.moves import http_cookiejar
-from six.moves import urllib
 
 from cinder import exception
 from cinder.i18n import _, _LE, _LI, _LW
@@ -45,7 +41,6 @@ class RestClient(object):
         self.san_address = san_address
         self.san_user = san_user
         self.san_password = san_password
-        self.init_http_head()
         self.storage_pools = kwargs.get('storage_pools',
                                         self.configuration.storage_pools)
         self.iscsi_info = kwargs.get('iscsi_info',
@@ -56,16 +51,22 @@ class RestClient(object):
         self.metro_domain = kwargs.get('metro_domain', None)
         self.semaphore = threading.Semaphore(20)
         self.call_lock = lockutils.ReaderWriterLock()
+        self.session = None
+        self.url = None
+
+        LOG.warning("Suppressing requests library SSL Warnings")
+        requests.packages.urllib3.disable_warnings(
+            requests.packages.urllib3.exceptions.InsecureRequestWarning)
+        requests.packages.urllib3.disable_warnings(
+            requests.packages.urllib3.exceptions.InsecurePlatformWarning)
 
     def init_http_head(self):
-        self.cookie = http_cookiejar.CookieJar()
         self.url = None
-        self.device_id = None
-        self.headers = {
+        self.session = requests.Session()
+        self.session.headers.update({
             "Connection": "keep-alive",
-            "Content-Type": "application/json",
-            "iBaseToken": "None",
-        }
+            "Content-Type": "application/json"})
+        self.session.verify = False
 
     def do_call(self, url=None, data=None, method=None,
                 calltimeout=constants.SOCKET_TIMEOUT, filter_flag=False):
@@ -76,61 +77,56 @@ class RestClient(object):
         """
         if self.url:
             url = self.url + url
-        handler = urllib.request.HTTPCookieProcessor(self.cookie)
-        opener = urllib.request.build_opener(handler)
-        urllib.request.install_opener(opener)
-        res_json = None
-        self.semaphore.acquire()
-        try:
-            create_unverified_https_context = ssl._create_unverified_context
-        except AttributeError:
-            # Legacy Python that doesn't verify HTTPS certificates by default
-            pass
+
+        kwargs = {'timeout': calltimeout}
+        if data:
+            kwargs['data'] = json.dumps(data)
+
+        if method in (None, 'POST'):
+            func = self.session.post
+        elif method in ('PUT',):
+            func = self.session.put
+        elif method in ('GET',):
+            func = self.session.get
+        elif method in ('DELETE',):
+            func = self.session.delete
         else:
-            # Handle target environment that doesn't support HTTPS verification
-            ssl._create_default_https_context = create_unverified_https_context
+            msg = _("Request method %s is invalid.") % method
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+
+        self.semaphore.acquire()
 
         try:
-            socket.setdefaulttimeout(calltimeout)
-            if data:
-                data = json.dumps(data)
-            req = urllib.request.Request(url, data, self.headers)
-            if method:
-                req.get_method = lambda: method
-            res = urllib.request.urlopen(req).read().decode("utf-8")
-            res_json = json.loads(res)
-
-            if not filter_flag:
-                LOG.info(_LI('\n\n\n\nRequest URL: %(url)s\n\n'
-                             'Call Method: %(method)s\n\n'
-                             'Request Data: %(data)s\n\n'
-                             'Response Data:%(res)s\n\n'),
-                         {'url': url,
-                          'method': method,
-                          'data': data,
-                          'res': res})
-
+            res = func(url, **kwargs)
         except Exception as err:
-            # If the array does not support the request, For example,
-            # the interface is not supported, the array will return HTTPError
-            # 404.
-            if (isinstance(err, urllib2.HTTPError)
-                    and err.code == constants.HTTP_ERROR_NOT_FOUND):
-                json_msg = ('{"error":{"code": %s,"description": "Not '
-                            'Found."}}') % constants.HTTP_ERROR_NOT_FOUND
-                res_json = json.loads(json_msg)
-                self.semaphore.release()
-                return res_json
-
-            LOG.error(_LE('Bad response from server: %(url)s.'
-                          ' Error: %(err)s'), {'url': url, 'err': err})
+            LOG.exception(_LE('Bad response from server: %(url)s.'
+                              ' Error: %(err)s'), {'url': url, 'err': err})
             json_msg = ('{"error":{"code": %s,"description": "Connect to '
                         'server error."}}') % constants.ERROR_CONNECT_TO_SERVER
-            res_json = json.loads(json_msg)
+            return json.loads(json_msg)
+        finally:
             self.semaphore.release()
-            return res_json
 
-        self.semaphore.release()
+        try:
+            res.raise_for_status()
+        except requests.HTTPError as exc:
+            json_msg = ('{"error":{"code": %(code)s,'
+                        '"description": "%(reason)s"}}'
+                        ) % {'code': exc.response.status_code,
+                             'reason': exc}
+            return json.loads(json_msg)
+
+        res_json = res.json()
+        if not filter_flag:
+            LOG.info(_LI('\n\n\n\nRequest URL: %(url)s\n\n'
+                         'Call Method: %(method)s\n\n'
+                         'Request Data: %(data)s\n\n'
+                         'Response Data:%(res)s\n\n'),
+                     {'url': url,
+                      'method': method,
+                      'data': data,
+                      'res': res_json})
 
         return res_json
 
@@ -157,7 +153,7 @@ class RestClient(object):
             device_id = result['data']['deviceid']
             self.device_id = device_id
             self.url = item_url + device_id
-            self.headers['iBaseToken'] = result['data']['iBaseToken']
+            self.session.headers['iBaseToken'] = result['data']['iBaseToken']
             if (result['data']['accountstate']
                     in constants.PWD_EXPIRED_OR_INITIAL):
                 self.logout()
@@ -186,7 +182,7 @@ class RestClient(object):
         When batch apporation failed
         """
         if (self.url is None
-                or old_token == self.headers['iBaseToken']):
+                or old_token == self.session.headers.get('iBaseToken')):
             old_url = self.url
             try:
                 self.login()
@@ -207,8 +203,16 @@ class RestClient(object):
         If fail, try another RestURL.
         """
         with self.call_lock.read_lock():
-            old_token = self.headers['iBaseToken']
-            result = self.do_call(url, data, method, filter_flag=filter_flag)
+            if self.url:
+                old_token = self.session.headers.get('iBaseToken')
+                result = self.do_call(url, data, method,
+                                      filter_flag=filter_flag)
+            else:
+                old_token = None
+                result = {"error": {
+                    "code": constants.ERROR_UNAUTHORIZED_TO_SERVER,
+                    "description": "unauthorized."}}
+
         error_code = result['error']['code']
         if (error_code == constants.ERROR_CONNECT_TO_SERVER
                 or error_code == constants.ERROR_UNAUTHORIZED_TO_SERVER):
@@ -1254,6 +1258,22 @@ class RestClient(object):
 
             data['pools'].append(pool)
         return data
+
+    def check_storage_pools(self):
+        result = self.get_all_pools()
+        s_pools = []
+        for pool in result:
+            if 'USAGETYPE' in pool:
+                if pool['USAGETYPE'] == constants.BLOCK_STORAGE_POOL_TYPE:
+                    s_pools.append(pool['NAME'])
+            else:
+                s_pools.append(pool['NAME'])
+        for pool_name in self.storage_pools:
+            if pool_name not in s_pools:
+                err_msg = (_('Block storage pool %s does not exist on '
+                             'the array.') % pool_name)
+                LOG.error(err_msg)
+                raise exception.VolumeBackendAPIException(data=err_msg)
 
     def _update_qos_policy_lunlist(self, lun_list, policy_id):
         url = "/ioclass/" + policy_id

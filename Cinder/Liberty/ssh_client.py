@@ -21,6 +21,7 @@ The common classes provide the drivers command line operation using SSH.
 
 import base64
 import re
+import six
 import socket
 import threading
 import time
@@ -28,7 +29,6 @@ from xml.etree import ElementTree as ET
 
 from oslo_log import log as logging
 from oslo_utils import excutils
-import six
 
 from cinder import context
 from cinder import exception
@@ -129,6 +129,30 @@ class TseriesClient(object):
         self.lun_distribution = self._get_lun_distribution_info(exist_luns)
         self.luncopy_list = self._get_all_luncopy_name()
         self.hostgroup_id = self._get_hostgroup_id(HOST_GROUP_NAME)
+
+    def check_storage_pools(self):
+        conf_pools = []
+        root = self.parse_xml_file(self.xml_file_path)
+        pools_conf = root.findall('LUN/StoragePool')
+        for pool in pools_conf:
+            conf_pools.append(pool.attrib['Name'].strip())
+
+        thick_pools = self._get_dev_pool_info('Thick')
+        thick_infos = {}
+        for pool in thick_pools:
+            thick_infos[pool[5]] = pool[0]
+
+        thin_pools = self._get_dev_pool_info('Thin')
+        thin_infos = {}
+        for pool in thin_pools:
+            thin_infos[pool[1]] = pool[0]
+
+        for pool in conf_pools:
+            if pool not in thick_infos and pool not in thin_infos:
+                err_msg = (_('Storage pool %s does not exist on the array.')
+                           % pool)
+                LOG.error(err_msg)
+                raise exception.VolumeBackendAPIException(data=err_msg)
 
     def parse_xml_file(self, xml_file_path):
         """Get root of xml file."""

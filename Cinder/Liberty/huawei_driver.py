@@ -16,6 +16,7 @@
 import collections
 import json
 import re
+import six
 import uuid
 
 from oslo_config import cfg
@@ -23,7 +24,6 @@ from oslo_config import types
 from oslo_log import log as logging
 from oslo_utils import excutils
 from oslo_utils import units
-import six
 
 from cinder import context
 from cinder import exception
@@ -136,6 +136,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         self.client = rest_client.RestClient(self.configuration,
                                              **client_conf)
         self.client.login()
+        self.client.check_storage_pools()
 
         # init hypermetro remote client
         hypermetro_devs = self.huawei_conf.get_hypermetro_devices()
@@ -578,8 +579,11 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         current_name = huawei_utils.encode_name(new_volume.id)
 
         lun_id = self.client.get_lun_id_by_name(current_name)
+        description = volume['name']
         try:
-            self.client.rename_lun(lun_id, original_name)
+            self.client.rename_lun(lun_id,
+                                   original_name,
+                                   description=description)
         except exception.VolumeBackendAPIException:
             LOG.error(_LE('Unable to rename lun %s on array.'), current_name)
             return {'_name_id': new_volume.name_id,
@@ -1726,24 +1730,27 @@ class HuaweiBaseDriver(driver.VolumeDriver):
     def delete_consistencygroup(self, context, group):
         volumes = self.db.volume_get_all_by_group(context, group.id)
         opts = self._get_consistencygroup_type(group)
-        model_update = {}
+        model_update = {'status': group.status}
         volumes_model_update = []
-        model_update.update({'status': group.status})
 
         if opts.get('hypermetro') == 'true':
             metro = hypermetro.HuaweiHyperMetro(self.client,
                                                 self.rmt_client,
                                                 self.configuration)
             metro.delete_consistencygroup(context, group, volumes)
+            model_update.update({'status': 'deleted'})
 
         for volume in volumes:
+            volume_model_update = {'id': volume.id}
             try:
                 self.delete_volume(volume)
-                volume.update({'status': 'deleted'})
-                volumes_model_update.append(volume)
             except Exception:
-                volume.update({'status': 'error_deleting'})
-                volumes_model_update.append(volume)
+                LOG.exception(_LE('Delete volume %s failed.'), volume)
+                volume_model_update.update({'status': 'error_deleting'})
+            else:
+                volume_model_update.update({'status': 'deleted'})
+
+            volumes_model_update.append(volume_model_update)
 
         return model_update, volumes_model_update
 

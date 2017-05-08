@@ -69,6 +69,7 @@ class HuaweiTISCSIDriver(driver.ISCSIDriver):
         self.sshclient = ssh_client.TseriesClient(configuration=
                                                   self.configuration)
         self.sshclient.do_setup(context)
+        self.sshclient.check_storage_pools()
 
     def check_for_setup_error(self):
         """Check something while starting."""
@@ -411,6 +412,7 @@ class HuaweiTFCDriver(driver.FibreChannelDriver):
         self.sshclient = ssh_client.TseriesClient(configuration=
                                                   self.configuration)
         self.sshclient.do_setup(context)
+        self.sshclient.check_storage_pools()
 
     def check_for_setup_error(self):
         """Check something while starting."""

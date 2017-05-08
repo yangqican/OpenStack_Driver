@@ -16,6 +16,7 @@
 import collections
 import json
 import re
+import six
 import uuid
 
 from oslo_config import cfg
@@ -23,7 +24,6 @@ from oslo_config import types
 from oslo_log import log as logging
 from oslo_utils import excutils
 from oslo_utils import units
-import six
 
 from cinder import context
 from cinder import exception
@@ -135,6 +135,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         self.client = rest_client.RestClient(self.configuration,
                                              **client_conf)
         self.client.login()
+        self.client.check_storage_pools()
 
         # init hypermetro remote client
         hypermetro_devs = self.huawei_conf.get_hypermetro_devices()
@@ -577,8 +578,11 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         current_name = huawei_utils.encode_name(new_volume.id)
 
         lun_id = self.client.get_lun_id_by_name(current_name)
+        description = volume['name']
         try:
-            self.client.rename_lun(lun_id, original_name)
+            self.client.rename_lun(lun_id,
+                                   original_name,
+                                   description=description)
         except exception.VolumeBackendAPIException:
             LOG.error(_LE('Unable to rename lun %s on array.'), current_name)
             return {'_name_id': new_volume.name_id,

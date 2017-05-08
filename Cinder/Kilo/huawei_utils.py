@@ -13,11 +13,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import six
 import time
 
 from oslo_log import log as logging
 from oslo_utils import units
-import six
 
 from cinder import exception
 from cinder.i18n import _
