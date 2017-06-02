@@ -38,6 +38,12 @@ class RestHelper(object):
         self.configuration = configuration
         self.session = None
 
+        LOG.warning("Suppressing requests library SSL Warnings")
+        requests.packages.urllib3.disable_warnings(
+            requests.packages.urllib3.exceptions.InsecureRequestWarning)
+        requests.packages.urllib3.disable_warnings(
+            requests.packages.urllib3.exceptions.InsecurePlatformWarning)
+
     def init_http_head(self):
         self.url = None
         self.session = requests.Session()
@@ -63,20 +69,13 @@ class RestHelper(object):
                        'method': method,
                        'data': data})
 
-        result = None
-
         kwargs = {'timeout': calltimeout}
         if data:
             kwargs['data'] = data
 
-        if method in (None, 'POST'):
-            func = self.session.post
-        elif method in ('PUT',):
-            func = self.session.put
-        elif method in ('GET',):
-            func = self.session.get
-        elif method in ('DELETE',):
-            func = self.session.delete
+        method = method or 'POST'
+        if method in ('POST', 'PUT', 'GET', 'DELETE'):
+            func = getattr(self.session, method.lower())
         else:
             msg = _("Request method %s is invalid.") % method
             LOG.error(msg)
@@ -87,9 +86,14 @@ class RestHelper(object):
         except Exception as err:
             LOG.error(_LE('\nBad response from server: %(url)s.'
                           ' Error: %(err)s'), {'url': url, 'err': err})
-            res = '{"error":{"code":%s,' \
-                  '"description":"Connect server error"}}' \
-                  % constants.ERROR_CONNECT_TO_SERVER
+            return {"error": {"code": constants.ERROR_CONNECT_TO_SERVER,
+                              "description": "Connect server error"}}
+
+        try:
+            res.raise_for_status()
+        except requests.HTTPError as exc:
+            return {"error": {"code": exc.response.status_code,
+                              "description": six.text_type(exc)}}
 
         result = res.json()
         LOG.debug('Response Data: %s', result)
