@@ -20,11 +20,240 @@ from oslo_log import log as logging
 from oslo_utils import excutils
 
 from cinder import exception
-from cinder.i18n import _, _LW, _LE
+from cinder.i18n import _, _LW, _LE, _LI
 from cinder.volume.drivers.huawei import constants
 from cinder.volume.drivers.huawei import huawei_utils
 
 LOG = logging.getLogger(__name__)
+
+
+class ReplicaCG(object):
+    def __init__(self, local_client, rmt_client, conf):
+        self.loc_client = local_client
+        self.rmt_client = rmt_client
+        self.conf = conf
+        self.op = PairOp(self.loc_client)
+        self.local_cgop = CGOp(self.loc_client)
+        self.rmt_cgop = CGOp(self.rmt_client)
+        self.driver = ReplicaCommonDriver(self.conf, self.op)
+
+    def create(self, group, replica_model):
+        group_id = group.get('id')
+        LOG.info(_LI("Create Consistency Group: %(group)s."),
+                 {'group': group_id})
+        group_name = huawei_utils.encode_name(group_id)
+        self.local_cgop.create(group_name, group_id, replica_model)
+
+    def delete(self, group, volumes):
+        group_id = group.get('id')
+        LOG.info(_LI("Delete Consistency Group: %(group)s."),
+                 {'group': group_id})
+        group_info = self._get_group_info_by_name(group_id)
+        replicg_id = group_info.get('ID', None)
+
+        if replicg_id:
+            if group_info.get('ISPRIMARY') == 'false':
+                msg = _("The CG is not primary, can't delete cg.")
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+            self.split_replicg(group_info)
+            for volume in volumes:
+                replica_data = get_replication_driver_data(volume)
+                pair_id = replica_data.get('pair_id')
+                if pair_id and self.op.check_pair_exist(pair_id):
+                    pair_info = self.op.get_replica_info(pair_id)
+                    if pair_info.get('CGID') == replicg_id:
+                        self.local_cgop.remove_pair_from_cg(replicg_id,
+                                                            pair_id)
+                    else:
+                        LOG.warning(_LW("The replication pair %(pair)s "
+                                        "is not in the consisgroup "
+                                        "%(group)s.")
+                                    % {'pair': pair_id,
+                                       'group': replicg_id})
+                else:
+                    LOG.warning(_LW("Replication pair "
+                                    "doesn't exist on array."))
+            self.local_cgop.delete(replicg_id)
+
+    def update(self, group, add_volumes, remove_volumes, replica_model):
+        group_id = group.get('id')
+        LOG.info(_LI("Update Consistency Group: %(group)s."),
+                 {'group': group_id})
+        group_info = self._get_group_info_by_name(group_id)
+        replicg_id = group_info.get('ID', None)
+
+        if replicg_id:
+            if group_info.get('ISPRIMARY') == 'false':
+                msg = _("The CG is not primary, can't operate cg.")
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+
+            self.split_replicg(group_info)
+            self._deal_add_volumes(replicg_id, add_volumes)
+            self._deal_remove_volumes(replicg_id, remove_volumes,
+                                      replica_model)
+
+            self.local_cgop.sync_replicg(replicg_id)
+        else:
+            msg = _("The CG does not exist on array.")
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+
+    def failover(self, replicg_id):
+        """Failover replicationcg.
+
+        Purpose:
+            1. Split replicationcg.
+            2. Set secondary access read & write.
+        """
+        info = self.rmt_cgop.get_replicg_info(replicg_id)
+        if info.get('ISPRIMARY') == 'true':
+            msg = _('We should not do switch over on primary array.')
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+
+        sync_status_set = (constants.REPLICG_STATUS_SYNCING,)
+        running_status = info.get('RUNNINGSTATUS')
+        if running_status in sync_status_set:
+            self.wait_replicg_ready(replicg_id)
+
+        if running_status != constants.REPLICG_STATUS_SPLITED:
+            self.rmt_cgop.split_replicg(replicg_id)
+            self.wait_split_ready(replicg_id)
+
+        self.rmt_cgop.set_cg_second_access(replicg_id,
+                                           constants.REPLICA_SECOND_RW)
+
+    def failback(self, replicg_id):
+        """Failover volumes back to primary backend.
+
+        The main steps:
+        1. Switch the role of replicationcg .
+        2. Copy the second LUN data back to primary LUN.
+        3. Split replicationcg .
+        4. Switch the role of replicationcg .
+        5. Enable replicationcg.
+        """
+        self.enable(replicg_id, self.local_cgop)
+        self.failover(replicg_id)
+        self.enable(replicg_id, self.rmt_cgop)
+
+
+    def enable(self, replicg_id, client):
+        info = client.get_replicg_info(replicg_id)
+        running_status = info.get('RUNNINGSTATUS')
+        if running_status != constants.REPLICG_STATUS_SPLITED:
+            client.split_replicg(replicg_id)
+            self.wait_split_ready(replicg_id)
+
+        if info.get('ISPRIMARY') == 'false':
+            client.switch_replicg(replicg_id)
+
+        client.set_cg_second_access(replicg_id, constants.REPLICA_SECOND_RO)
+        client.sync_replicg(replicg_id)
+        self.wait_replicg_ready(replicg_id)
+
+
+    def _deal_add_volumes(self, replicg_id, add_volumes):
+        for volume in add_volumes:
+            replica_data = get_replication_driver_data(volume)
+            pair_id = replica_data.get('pair_id')
+            if pair_id and self.op.check_pair_exist(pair_id):
+                pair_info = self.op.get_replica_info(pair_id)
+                if pair_info.get('ISPRIMARY') == 'true':
+                    self.driver.split(pair_id)
+                    self.local_cgop.add_pair_to_cg(replicg_id, pair_id)
+                else:
+                    msg = _("The replication pair is not primary.")
+                    LOG.error(msg)
+                    raise exception.VolumeBackendAPIException(data=msg)
+            else:
+                err_msg = _("Replication pair doesn't exist on array.")
+                LOG.error(err_msg)
+                raise exception.VolumeBackendAPIException(data=err_msg)
+
+    def _deal_remove_volumes(self, replicg_id, remove_volumes, replica_model):
+        for volume in remove_volumes:
+            replica_data = get_replication_driver_data(volume)
+            pair_id = replica_data.get('pair_id')
+            if pair_id and self.op.check_pair_exist(pair_id):
+                pair_info = self.op.get_replica_info(pair_id)
+                if pair_info.get('CGID') == replicg_id:
+                    self.local_cgop.remove_pair_from_cg(replicg_id, pair_id)
+                    wait_complete = False
+                    if replica_model == constants.REPLICA_SYNC_MODEL:
+                        wait_complete = True
+                    self.driver.sync(pair_id, wait_complete)
+                else:
+                    LOG.warning(_LW("The replication pair %(pair)s is not "
+                                "in the consisgroup %(group)s.")
+                                % {'pair': pair_id, 'group': replicg_id})
+            else:
+                LOG.warning(_LW("Replication pair doesn't exist on array."))
+
+    def _get_group_info_by_name(self, group_id):
+        group_name = huawei_utils.encode_name(group_id)
+        group_info = self.local_cgop.get_replicg_by_name(group_name)
+        return group_info
+
+    def split_replicg(self, group_info):
+        if group_info.get('ISEMPTY') == 'true':
+            return
+
+        running_status = group_info.get('RUNNINGSTATUS')
+        replicg_id = group_info.get('ID')
+        status = (constants.REPLICG_STATUS_INTERRUPTED,
+                  constants.REPLICG_STATUS_SYNCING,
+                  constants.REPLICG_STATUS_TO_BE_RECOVERD,
+                  constants.REPLICG_STATUS_NORMAL)
+        if running_status in status:
+            self.local_cgop.split_replicg(replicg_id)
+            self.wait_split_ready(replicg_id)
+        elif running_status == constants.REPLICG_STATUS_INVALID:
+            err_msg = _("Replicg is invalid.")
+            LOG.error(err_msg)
+            raise exception.VolumeBackendAPIException(data=err_msg)
+
+    def wait_split_ready(self, replicg_id):
+        def _check_state():
+            info = self.rmt_cgop.get_replicg_info(replicg_id)
+            if info.get('RUNNINGSTATUS') == constants.REPLICG_STATUS_SPLITED:
+                return True
+            return False
+
+        interval = constants.DEFAULT_REPLICA_WAIT_INTERVAL
+        timeout = constants.DEFAULT_REPLICA_WAIT_TIMEOUT
+        huawei_utils.wait_for_condition(_check_state, interval, timeout)
+
+    def wait_replicg_ready(self, replicg_id, interval=None, timeout=None):
+        LOG.info(_LI('Wait synchronize complete.'))
+        running_status_normal = (constants.REPLICG_STATUS_NORMAL,)
+        running_status_sync = (constants.REPLICG_STATUS_SYNCING,)
+
+        def _replicg_ready():
+            info = self.rmt_cgop.get_replicg_info(replicg_id)
+            if (info.get('RUNNINGSTATUS') in running_status_normal and
+                    info.get('HEALTHSTATUS') ==
+                    constants.REPLICG_HEALTH_NORMAL):
+                return True
+
+            if info.get('RUNNINGSTATUS') not in running_status_sync:
+                msg = (_('Wait synchronize failed. Running status: %s.') %
+                       info.get('RUNNINGSTATUS'))
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+
+            return False
+
+        if not interval:
+            interval = constants.DEFAULT_WAIT_INTERVAL
+        if not timeout:
+            timeout = constants.DEFAULT_WAIT_TIMEOUT
+
+        huawei_utils.wait_for_condition(_replicg_ready,
+                                        interval,
+                                        timeout)
 
 
 class AbsReplicaOp(object):
@@ -138,9 +367,57 @@ class PairOp(AbsReplicaOp):
     def get_replica_info(self, pair_id):
         return self.client.get_pair_by_id(pair_id)
 
+    def check_pair_exist(self, pair_id):
+        return self.client.check_pair_exist(pair_id)
 
 class CGOp(AbsReplicaOp):
-    pass
+    def create(self, group_name, group_id, replica_model):
+        data = {'NAME': group_name,
+                'DESCRIPTION': group_id,
+                'RECOVERYPOLICY': '1',
+                'REPLICATIONMODEL': replica_model,
+                'SPEED': constants.REPLICA_SPEED}
+
+        if replica_model == constants.REPLICA_ASYNC_MODEL:
+            # Synchronize type values:
+            # 1, manual
+            # 2, timed wait when synchronization begins
+            # 3, timed wait when synchronization ends
+            data['SYNCHRONIZETYPE'] = '2'
+            data['TIMINGVAL'] = constants.REPLICG_PERIOD
+
+        self.client.create_replicg(data)
+
+    def delete(self, replicg_id):
+        self.client.delete_replicg(replicg_id)
+
+    def remove_pair_from_cg(self, replicg_id, pair_id):
+        self.client.remove_replipair_from_replicg(replicg_id,
+                                                  [pair_id])
+
+    def add_pair_to_cg(self, replicg_id, pair_id):
+        self.client.add_replipair_to_replicg(replicg_id,
+                                             [pair_id])
+
+    def sync_replicg(self, replicg_id):
+        self.client.sync_replicg(replicg_id)
+
+    def get_replicg_info(self, replicg_id):
+        info = self.client.get_replicg_info(replicg_id)
+        return info
+
+    def split_replicg(self, replicg_id):
+        self.client.split_replicg(replicg_id)
+
+    def get_replicg_by_name(self, group_name):
+        info = self.client.get_replicg_by_name(group_name)
+        return info
+
+    def set_cg_second_access(self, replicg_id, access):
+        self.client.set_cg_second_access(replicg_id, access)
+
+    def switch_replicg(self, replicg_id):
+        self.client.switch_replicg(replicg_id)
 
 
 class ReplicaCommonDriver(object):
@@ -552,6 +829,8 @@ class ReplicaPairManager(object):
         5. Enable replications.
         """
         volumes_update = []
+        cgid_list = set()
+        replicacg = ReplicaCG(self.local_client, self.rmt_client, self.conf)
         for v in volumes:
             v_update = {}
             v_update['volume_id'] = v.id
@@ -570,17 +849,24 @@ class ReplicaPairManager(object):
                 volumes_update.append(v_update)
                 continue
 
-            # Switch replication pair role, and start synchronize.
-            self.local_driver.enable(pair_id)
+            replica_info = self.local_op.get_replica_info(pair_id)
+            consisgroup_id = replica_info.get('CGID')
+            if consisgroup_id:
+                if consisgroup_id not in cgid_list:
+                    replicacg.failback(consisgroup_id)
+                    cgid_list.add(consisgroup_id)
+            else:
+                # Switch replication pair role, and start synchronize.
+                self.local_driver.enable(pair_id)
 
-            # Wait for synchronize complete.
-            self.local_driver.wait_replica_ready(pair_id)
+                # Wait for synchronize complete.
+                self.local_driver.wait_replica_ready(pair_id)
 
-            # Split replication pair again
-            self.rmt_driver.failover(pair_id)
+                # Split replication pair again
+                self.rmt_driver.failover(pair_id)
 
-            # Switch replication pair role, and start synchronize.
-            self.rmt_driver.enable(pair_id)
+                # Switch replication pair role, and start synchronize.
+                self.rmt_driver.enable(pair_id)
 
             lun_info = self.rmt_client.get_lun_info(rmt_lun_id)
             admin_metadata = huawei_utils.get_admin_metadata(v)
@@ -602,6 +888,8 @@ class ReplicaPairManager(object):
         Split the replication pairs and make the secondary LUNs R&W.
         """
         volumes_update = []
+        cgid_list = set()
+        replicacg = ReplicaCG(self.local_client, self.rmt_client, self.conf)
         for v in volumes:
             v_update = {}
             v_update['volume_id'] = v.id
@@ -620,7 +908,14 @@ class ReplicaPairManager(object):
                 volumes_update.append(v_update)
                 continue
 
-            self.rmt_driver.failover(pair_id)
+            replica_info = self.rmt_op.get_replica_info(pair_id)
+            consisgroup_id = replica_info.get('CGID')
+            if consisgroup_id:
+                if consisgroup_id not in cgid_list:
+                    replicacg.failover(consisgroup_id)
+                    cgid_list.add(consisgroup_id)
+            else:
+                self.rmt_driver.failover(pair_id)
 
             lun_info = self.rmt_client.get_lun_info(rmt_lun_id)
             admin_metadata = huawei_utils.get_admin_metadata(v)

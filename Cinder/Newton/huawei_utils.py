@@ -112,3 +112,8 @@ def get_snapshot_metadata_value(snapshot):
         return {item['key']: item['value'] for item in metadata}
 
     return {}
+
+
+def convert_connector_wwns(wwns):
+    if wwns:
+        return map(lambda x: x.lower(), wwns)

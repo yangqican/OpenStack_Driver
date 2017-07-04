@@ -511,7 +511,7 @@ class RestClient(object):
         return False
 
     def do_mapping(self, lun_id, hostgroup_id, host_id, portgroup_id=None,
-                   lun_type=constants.LUN_TYPE):
+                   lun_type=constants.LUN_TYPE, hypermetro_lun=False):
         """Add hostgroup and lungroup to mapping view."""
         lungroup_name = constants.LUNGROUP_PREFIX + host_id
         mapping_view_name = constants.MAPPING_VIEW_PREFIX + host_id
@@ -554,8 +554,7 @@ class RestClient(object):
                         self._associate_portgroup_to_view(view_id,
                                                           portgroup_id)
 
-            version = self.find_array_version()
-            if version >= constants.ARRAY_VERSION:
+            if hypermetro_lun:
                 aval_luns = self.find_view_by_id(view_id)
                 map_info["lun_id"] = lun_id
                 map_info["view_id"] = view_id
@@ -2464,3 +2463,101 @@ class RestClient(object):
 
         if result.get("data"):
             return result.get("data").get("COUNT")
+
+    def create_replicg(self, replicg_param):
+        url = '/CONSISTENTGROUP'
+        result = self.call(url, replicg_param, "POST")
+
+        msg = (_("Create replication group %(res)s error.")
+               % {'res': replicg_param['DESCRIPTION']})
+        self._assert_rest_result(result, msg)
+
+    def get_replicg_by_name(self, group_name):
+        url = "/CONSISTENTGROUP?filter=NAME::%s" % group_name
+        result = self.call(url, None, 'GET')
+
+        msg = (_("Get replication consisgroup %(name)s failed.")
+               % {'name': group_name})
+        self._assert_rest_result(result, msg)
+        if 'data' in result:
+            return result['data'][0]
+        else:
+            return {}
+
+    def add_replipair_to_replicg(self, replicg_id, pair_ids):
+        url = '/ADD_MIRROR'
+        data = {'ID': replicg_id,
+                'RMLIST': pair_ids}
+        result = self.call(url, data, "PUT")
+        msg = (_("Add repli_pair %(pair)s to replicg %(group)s error.")
+               % {'pair': pair_ids, 'group': replicg_id})
+        self._assert_rest_result(result, msg)
+
+    def remove_replipair_from_replicg(self, replicg_id, pair_ids):
+        url = '/DEL_MIRROR'
+        data = {'ID': replicg_id,
+                'RMLIST': pair_ids}
+        result = self.call(url, data, "PUT")
+        msg = (_("Remove repli_pair %(pair)s from "
+                 "replicg %(group)s error.")
+               % {'pair': pair_ids, 'group': replicg_id})
+        self._assert_rest_result(result, msg)
+
+    def split_replicg(self, replicg_id):
+        url = '/SPLIT_CONSISTENCY_GROUP'
+        data = {'ID': replicg_id}
+        result = self.call(url, data, "PUT")
+        msg = (_("Split replicg %(group)s error.")
+               % {'group': replicg_id})
+        self._assert_rest_result(result, msg)
+
+    def delete_replicg(self, replicg_id):
+        url = '/CONSISTENTGROUP/%s?ISLOCALDELETE=0' % replicg_id
+        result = self.call(url, None, "DELETE")
+        msg = (_("Delete replicg %(group)s error.")
+               % {'group': replicg_id})
+        self._assert_rest_result(result, msg)
+
+    def sync_replicg(self, replicg_id):
+        url = '/SYNCHRONIZE_CONSISTENCY_GROUP'
+        data = {'ID': replicg_id}
+        result = self.call(url, data, "PUT")
+        if result['error']['code'] == constants.REPLICG_IS_EMPTY:
+            LOG.warning(_LW("Replicg %(group)s does not have "
+                        "remote replications.")
+                        % {'group': replicg_id})
+            return
+        msg = (_("Sync replicg %(group)s error.")
+               % {'group': replicg_id})
+        self._assert_rest_result(result, msg)
+
+    def get_replicg_info(self, replicg_id):
+        url = '/CONSISTENTGROUP/%s' % replicg_id
+        result = self.call(url, None, 'GET')
+
+        msg = (_("Get replication consisgroup %(group)s failed.")
+               % {'group': replicg_id})
+        self._assert_rest_result(result, msg)
+        self._assert_data_in_result(result, msg)
+        return result['data']
+
+    def set_cg_second_access(self, replicg_id, access):
+        url = "/CONSISTENTGROUP/" + replicg_id
+        data = {"SECRESACCESS": access}
+        result = self.call(url, data, "PUT")
+
+        msg = (_("Set cg %(group)s secondary access"
+                 " to %(access)% failed.")
+               % {'group': replicg_id, 'access': access})
+        self._assert_rest_result(result, msg)
+
+    def switch_replicg(self, replicg_id):
+        url = '/SWITCH_GROUP_ROLE'
+        data = {'ID': replicg_id}
+        result = self.call(url, data, 'PUT')
+
+        msg = (_("Switch replication consisgroup "
+                 "%(group)s error.")
+               % {'group': replicg_id})
+        self._assert_rest_result(result, msg)
+

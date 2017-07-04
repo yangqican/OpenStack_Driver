@@ -89,6 +89,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         self.replica = None
         self.use_ultrapath = self.configuration.safe_get(
             'libvirt_iscsi_use_ultrapath')
+        self.sn = 'NA'
 
     def check_func_support(self, obj_name):
         try:
@@ -100,6 +101,13 @@ class HuaweiBaseDriver(driver.VolumeDriver):
     def check_rmt_func_support(self, obj_name):
         try:
             self.rmt_client._get_object_count(obj_name)
+            return True
+        except Exception:
+            return False
+
+    def check_replica_func_support(self, obj_name):
+        try:
+            self.replica_client._get_object_count(obj_name)
             return True
         except Exception:
             return False
@@ -134,7 +142,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
         self.client = rest_client.RestClient(self.configuration,
                                              **client_conf)
-        self.client.login()
+        self.sn = self.client.login()
         self.client.check_storage_pools()
 
         # init hypermetro remote client
@@ -337,6 +345,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         admin_metadata.update({'huawei_lun_wwn': lun_info['WWN']})
         model_update['admin_metadata'] = admin_metadata
         metadata = huawei_utils.get_volume_metadata(volume)
+        metadata.update({'huawei_sn': self.sn})
         model_update['metadata'] = metadata
         return lun_info, model_update
 
@@ -579,7 +588,16 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
         lun_id = self.client.get_lun_id_by_name(current_name)
         description = volume['name']
+        metadata = huawei_utils.get_volume_metadata(volume)
+        new_metadata = huawei_utils.get_volume_metadata(new_volume)
+        sn = metadata.get('huawei_sn')
+        new_sn = new_metadata.get('huawei_sn')
         try:
+            if sn == new_sn:
+                src_id = self.client.get_lun_id_by_name(original_name)
+                src_lun_name = str(uuid.uuid4())
+                src_lun_name = huawei_utils.encode_name(src_lun_name)
+                self.client.rename_lun(src_id, src_lun_name)
             self.client.rename_lun(lun_id,
                                    original_name,
                                    description=description)
@@ -899,7 +917,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
         self.client.extend_lun(lun_id, new_size)
 
-    def create_snapshot(self, snapshot):
+    def _create_snapshot_base(self, snapshot):
         volume = snapshot.volume
         if not volume:
             msg = (_("Can't get volume id from snapshot, snapshot: %(id)s")
@@ -932,7 +950,10 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         huawei_utils.wait_for_condition(_snapshot_ready,
                                         constants.DEFAULT_WAIT_INTERVAL,
                                         constants.DEFAULT_WAIT_INTERVAL * 10)
+        return snapshot_id
 
+    def create_snapshot(self, snapshot):
+        snapshot_id = self._create_snapshot_base(snapshot)
         try:
             self.client.activate_snapshot(snapshot_id)
         except Exception:
@@ -1521,12 +1542,16 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                   {'old_name': lun_info.get('NAME'),
                    'new_name': new_name})
         self.client.rename_lun(lun_id, new_name, description)
-        metadata = huawei_utils.get_admin_metadata(volume)
-        metadata.update({'huawei_lun_wwn': lun_info['WWN']})
+        admin_metadata = huawei_utils.get_admin_metadata(volume)
+        admin_metadata.update({'huawei_lun_wwn': lun_info['WWN']})
+        metadata = huawei_utils.get_volume_metadata(volume)
+        metadata.update({'huawei_sn': self.sn})
+
 
         model_update = {}
-        model_update.update({'admin_metadata': metadata})
+        model_update.update({'admin_metadata': admin_metadata})
         model_update.update({'provider_location': lun_id})
+        model_update.update({'metadata': metadata})
 
         if new_opts and new_opts.get('replication_enabled'):
             LOG.debug("Manage volume need to create replication.")
@@ -1699,9 +1724,16 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         model_update = {'status': 'available'}
         opts = self._get_consistencygroup_type(group)
 
-        if (opts.get('hypermetro') == 'true'):
+        if (opts.get('hypermetro') == 'true'
+                and opts.get('replication_enabled') == 'true'):
+            err_msg = _("Hypermetro and Replication can not be "
+                        "used in the same volume_type.")
+            LOG.error(err_msg)
+            raise exception.VolumeBackendAPIException(data=err_msg)
+
+        if opts.get('hypermetro') == 'true':
             if not self.check_func_support("HyperMetro_ConsistentGroup"):
-                msg = (_LE("Can't create consistency group, array not "
+                msg = (_("Can't create consistency group, array not "
                            "support hypermetro consistentgroup, "
                            "group id: %(group_id)s.")
                        % {"group_id": group.id})
@@ -1709,7 +1741,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                 raise exception.VolumeBackendAPIException(data=msg)
 
             if not self.check_rmt_func_support("HyperMetro_ConsistentGroup"):
-                msg = (_LE("Can't create consistency group, remote array "
+                msg = (_("Can't create consistency group, remote array "
                            "not support hypermetro consistentgroup, "
                            "group id: %(group_id)s.")
                        % {"group_id": group.id})
@@ -1720,6 +1752,31 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                                                 self.rmt_client,
                                                 self.configuration)
             metro.create_consistencygroup(group)
+            return model_update
+
+        if opts.get('replication_enabled') == 'true':
+            if not self.check_func_support("CONSISTENTGROUP"):
+                msg = (_("Can't create consistency group, array not "
+                           "support replication consistentgroup, "
+                           "group id: %(group_id)s.")
+                       % {"group_id": group.id})
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+
+            if not self.check_replica_func_support("CONSISTENTGROUP"):
+                msg = (_("Can't create consistency group, remote array "
+                           "not support replication consistentgroup, "
+                           "group id: %(group_id)s.")
+                       % {"group_id": group.id})
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+
+            replica_model = opts.get('replication_type',
+                                     constants.REPLICA_ASYNC_MODEL)
+            replicg = replication.ReplicaCG(self.client,
+                                            self.replica_client,
+                                            self.configuration)
+            replicg.create(group, replica_model)
             return model_update
 
         # Array will create CG at create_cgsnapshot time. Cinder will
@@ -1736,6 +1793,13 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                                                 self.rmt_client,
                                                 self.configuration)
             metro.delete_consistencygroup(context, group, volumes)
+            model_update.update({'status': 'deleted'})
+
+        if opts.get('replication_enabled') == 'true':
+            replicg = replication.ReplicaCG(self.client,
+                                            self.replica_client,
+                                            self.configuration)
+            replicg.delete(group, volumes)
             model_update.update({'status': 'deleted'})
 
         for volume in volumes:
@@ -1767,6 +1831,15 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                                           remove_volumes)
             return model_update, None, None
 
+        if opts.get('replication_enabled') == 'true':
+            replica_model = opts.get('replication_type',
+                                     constants.REPLICA_ASYNC_MODEL)
+            replicg = replication.ReplicaCG(self.client,
+                                            self.replica_client,
+                                            self.configuration)
+            replicg.update(group, add_volumes, remove_volumes, replica_model)
+            return model_update, None, None
+
         for volume in add_volumes:
             try:
                 self._check_volume_exist_on_array(
@@ -1790,33 +1863,22 @@ class HuaweiBaseDriver(driver.VolumeDriver):
 
         try:
             for snapshot in snapshots:
-                volume = snapshot.volume
-                if not volume:
-                    msg = (_("Can't get volume id from snapshot, "
-                             "snapshot: %(id)s") % {"id": snapshot.id})
-                    LOG.error(msg)
-                    raise exception.VolumeBackendAPIException(data=msg)
-
-                volume_name = huawei_utils.encode_name(volume.id)
-
-                lun_id = self.client.get_lun_id(volume, volume_name)
-                snapshot_name = huawei_utils.encode_name(snapshot.id)
-                snapshot_description = snapshot.id
-                info = self.client.create_snapshot(lun_id,
-                                                   snapshot_name,
-                                                   snapshot_description)
+                snapshot_id = self._create_snapshot_base(snapshot)
+                info = self.client.get_snapshot_info(snapshot_id)
                 metadata = {'huawei_snapshot_wwn': info['WWN']}
                 snapshot_model_update = {'id': snapshot.id,
                                          'status': 'available',
-                                         'provider_location': info['ID']}
-                snapshot.update({'metadata': metadata})
-                snapshot.save()
+                                         'provider_location': info['ID'],
+                                         'metadata': metadata}
+
                 snapshots_model_update.append(snapshot_model_update)
                 added_snapshots_info.append(info)
         except Exception:
             with excutils.save_and_reraise_exception():
                 LOG.error(_LE("Create cgsnapshots failed. "
                               "Cgsnapshot id: %s."), cgsnapshot.id)
+                for added_snapshot in added_snapshots_info:
+                    self.client.delete_snapshot(added_snapshot['ID'])
 
         snapshot_ids = [added_snapshot['ID']
                         for added_snapshot in added_snapshots_info]
@@ -1826,6 +1888,8 @@ class HuaweiBaseDriver(driver.VolumeDriver):
             with excutils.save_and_reraise_exception():
                 LOG.error(_LE("Active cgsnapshots failed. "
                               "Cgsnapshot id: %s."), cgsnapshot.id)
+                for snapshot_id in snapshot_ids:
+                    self.client.delete_snapshot(snapshot_id)
 
         model_update['status'] = 'available'
 
@@ -1947,14 +2011,24 @@ class HuaweiBaseDriver(driver.VolumeDriver):
     def failover_host(self, context, volumes, secondary_id=None):
         """Failover all volumes to secondary."""
         if secondary_id == 'default':
-            secondary_id, volumes_update = self._failback(volumes)
+            try:
+                secondary_id, volumes_update = self._failback(volumes)
+            except exception.VolumeBackendAPIException:
+                msg = _("Error encountered during failback.")
+                LOG.exception(msg)
+                raise exception.VolumeDriverException(data=msg)
         elif (secondary_id == self.replica_dev_conf['backend_id']
                 or secondary_id is None):
-            secondary_id, volumes_update = self._failover(volumes)
+            try:
+                secondary_id, volumes_update = self._failover(volumes)
+            except exception.VolumeBackendAPIException:
+                msg = _("Error encountered during failover.")
+                LOG.exception(msg)
+                raise exception.VolumeDriverException(data=msg)
         else:
             msg = _("Invalid secondary id %s.") % secondary_id
             LOG.error(msg)
-            raise exception.VolumeBackendAPIException(data=msg)
+            raise exception.InvalidReplicationTarget(data=msg)
 
         return secondary_id, volumes_update
 
@@ -2170,9 +2244,12 @@ class HuaweiISCSIDriver(HuaweiBaseDriver, driver.ISCSIDriver):
 
         hostgroup_id = client.add_host_to_hostgroup(host_id)
 
+        metadata = huawei_utils.get_volume_metadata(volume)
+        hypermetro_lun = 'hypermetro_id' in metadata
+
         # Mapping lungroup and hostgroup to view.
         map_info = client.do_mapping(lun_id, hostgroup_id, host_id,
-                                     portgroup_id, lun_type)
+                                     portgroup_id, lun_type, hypermetro_lun)
 
         hostlun_id = client.get_host_lun_id(host_id, lun_id, lun_type)
 
@@ -2367,7 +2444,8 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
             volume, constants.VOLUME_NOT_EXISTS_RAISE)
         lun_info = self.client.get_lun_info(lun_id, lun_type)
 
-        wwns = connector['wwpns']
+        conn_wwpns = huawei_utils.convert_connector_wwns(connector['wwpns'])
+        wwns = conn_wwpns
         LOG.info(_LI(
             'initialize_connection, initiator: %(wwpns)s,'
             ' LUN ID: %(lun_id)s, lun type: %(lun_type)s.'),
@@ -2435,9 +2513,14 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
 
         # Add host into hostgroup.
         hostgroup_id = self.client.add_host_to_hostgroup(host_id)
+
+        metadata = huawei_utils.get_volume_metadata(volume)
+        LOG.info(_LI("initialize_connection, metadata is: %s."), metadata)
+        hypermetro_lun = 'hypermetro_id' in metadata
+
         map_info = self.client.do_mapping(lun_id, hostgroup_id,
                                           host_id, portg_id,
-                                          lun_type)
+                                          lun_type, hypermetro_lun)
         host_lun_id = self.client.get_host_lun_id(host_id, lun_id,
                                                   lun_type)
 
@@ -2454,9 +2537,7 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
                             self.use_ultrapath}, }
 
         # Deal with hypermetro connection.
-        metadata = huawei_utils.get_volume_metadata(volume)
-        LOG.info(_LI("initialize_connection, metadata is: %s."), metadata)
-        if 'hypermetro_id' in metadata:
+        if hypermetro_lun:
             loc_tgt_wwn = fc_info['data']['target_wwn']
             local_ini_tgt_map = fc_info['data']['initiator_target_map']
             hyperm = hypermetro.HuaweiHyperMetro(self.client,
@@ -2467,7 +2548,7 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
             rmt_tgt_wwn = rmt_fc_info['data']['target_wwn']
             rmt_ini_tgt_map = rmt_fc_info['data']['initiator_target_map']
             fc_info['data']['target_wwn'] = (loc_tgt_wwn + rmt_tgt_wwn)
-            wwns = connector['wwpns']
+            wwns = conn_wwpns
             for wwn in wwns:
                 if (wwn in local_ini_tgt_map
                         and wwn in rmt_ini_tgt_map):
@@ -2500,7 +2581,8 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
         lun_id, lun_type = self.get_lun_id_and_type(
             volume, constants.VOLUME_NOT_EXISTS_WARN)
 
-        wwns = connector['wwpns']
+        conn_wwpns = huawei_utils.convert_connector_wwns(connector['wwpns'])
+        wwns = conn_wwpns
 
         host_name = connector['host']
         left_lunnum = -1
