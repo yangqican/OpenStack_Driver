@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import json
 import six
 import time
 
@@ -114,3 +115,41 @@ def get_snapshot_metadata_value(snapshot):
 def convert_connector_wwns(wwns):
     if wwns:
         return map(lambda x: x.lower(), wwns)
+
+
+def to_string(**kwargs):
+    return json.dumps(kwargs) if kwargs else ''
+
+
+def get_lun_metadata(volume):
+    if not volume.provider_location:
+        return {}
+
+    info = json.loads(volume.provider_location)
+    if isinstance(info, dict):
+        return info
+
+    # To keep compatible with old driver version
+    admin_metadata = get_admin_metadata(volume)
+    metadata = get_volume_metadata(volume)
+    return {'huawei_lun_id': six.text_type(info),
+            'huawei_lun_wwn': admin_metadata.get('huawei_lun_wwn'),
+            'huawei_sn': metadata.get('huawei_sn'),
+            'hypermetro_id': metadata.get('hypermetro_id'),
+            'remote_lun_id': metadata.get('remote_lun_id'),
+            }
+
+
+def get_snapshot_metadata(snapshot):
+    if not snapshot.provider_location:
+        return {}
+
+    info = json.loads(snapshot.provider_location)
+    if isinstance(info, dict):
+        return info
+
+    # To keep compatible with old driver version
+    metadata = get_snapshot_metadata_value(snapshot)
+    return {'huawei_snapshot_id': six.text_type(info),
+            'huawei_snapshot_wwn': metadata.get('huawei_snapshot_wwn'),
+            }

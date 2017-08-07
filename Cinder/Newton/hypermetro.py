@@ -76,7 +76,7 @@ class HuaweiHyperMetro(object):
 
     def delete_hypermetro(self, volume):
         """Delete hypermetro."""
-        metadata = huawei_utils.get_volume_metadata(volume)
+        metadata = huawei_utils.get_lun_metadata(volume)
         metro_id = metadata['hypermetro_id']
         remote_lun_id = metadata['remote_lun_id']
 
@@ -113,7 +113,7 @@ class HuaweiHyperMetro(object):
             {'wwpns': wwns,
              'volume': volume_name})
 
-        metadata = huawei_utils.get_volume_metadata(volume)
+        metadata = huawei_utils.get_lun_metadata(volume)
         lun_id = metadata['remote_lun_id']
 
         if lun_id is None:
@@ -188,7 +188,7 @@ class HuaweiHyperMetro(object):
         """Delete map between a volume and a host for FC."""
         wwns = connector['wwpns']
         volume_name = huawei_utils.encode_name(volume.id)
-        metadata = huawei_utils.get_volume_metadata(volume)
+        metadata = huawei_utils.get_lun_metadata(volume)
         lun_id = metadata['remote_lun_id']
         host_name = connector['host']
         left_lunnum = -1
@@ -280,7 +280,7 @@ class HuaweiHyperMetro(object):
         if metrogroup_id:
             # Remove pair from metrogroup.
             for volume in volumes:
-                metadata = huawei_utils.get_volume_metadata(volume)
+                metadata = huawei_utils.get_lun_metadata(volume)
                 metro_id = metadata['hypermetro_id']
                 if metro_id and self.client.check_hypermetro_exist(metro_id):
                     if self._check_metro_in_cg(metro_id, metrogroup_id):
@@ -305,7 +305,7 @@ class HuaweiHyperMetro(object):
         if metrogroup_id:
             # Deal with add volumes to CG
             for volume in add_volumes:
-                metadata = huawei_utils.get_volume_metadata(volume)
+                metadata = huawei_utils.get_lun_metadata(volume)
                 metro_id = metadata['hypermetro_id']
                 if metro_id and self.client.check_hypermetro_exist(metro_id):
                     if not self._check_metro_in_cg(metro_id, metrogroup_id):
@@ -319,7 +319,7 @@ class HuaweiHyperMetro(object):
 
             # Deal with remove volumes from CG
             for volume in remove_volumes:
-                metadata = huawei_utils.get_volume_metadata(volume)
+                metadata = huawei_utils.get_lun_metadata(volume)
                 metro_id = metadata['hypermetro_id']
                 if metro_id and self.client.check_hypermetro_exist(metro_id):
                     if self._check_metro_in_cg(metro_id, metrogroup_id):

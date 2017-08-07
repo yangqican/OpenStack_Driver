@@ -16,6 +16,7 @@
 import json
 import netaddr
 import requests
+from requests.adapters import HTTPAdapter
 import six
 import threading
 import time
@@ -28,8 +29,16 @@ from cinder import exception
 from cinder.i18n import _, _LE, _LI, _LW
 from cinder import utils
 from cinder.volume.drivers.huawei import constants
+from cinder.volume.drivers.huawei import huawei_utils
 
 LOG = logging.getLogger(__name__)
+
+
+class HostNameIgnoringAdapter(HTTPAdapter):
+    def cert_verify(self, conn, url, verify, cert):
+        conn.assert_hostname = False
+        return super(HostNameIgnoringAdapter, self).cert_verify(
+            conn, url, verify, cert)
 
 
 class RestClient(object):
@@ -53,12 +62,15 @@ class RestClient(object):
         self.call_lock = lockutils.ReaderWriterLock()
         self.session = None
         self.url = None
+        self.ssl_cert_verify = self.configuration.ssl_cert_verify
+        self.ssl_cert_path = self.configuration.ssl_cert_path
 
-        LOG.warning("Suppressing requests library SSL Warnings")
-        requests.packages.urllib3.disable_warnings(
-            requests.packages.urllib3.exceptions.InsecureRequestWarning)
-        requests.packages.urllib3.disable_warnings(
-            requests.packages.urllib3.exceptions.InsecurePlatformWarning)
+        if not self.ssl_cert_verify:
+            LOG.warning("Suppressing requests library SSL Warnings")
+            requests.packages.urllib3.disable_warnings(
+                requests.packages.urllib3.exceptions.InsecureRequestWarning)
+            requests.packages.urllib3.disable_warnings(
+                requests.packages.urllib3.exceptions.InsecurePlatformWarning)
 
     def init_http_head(self):
         self.url = None
@@ -67,6 +79,9 @@ class RestClient(object):
             "Connection": "keep-alive",
             "Content-Type": "application/json"})
         self.session.verify = False
+
+        if self.ssl_cert_verify:
+            self.session.verify = self.ssl_cert_path
 
     def do_call(self, url=None, data=None, method=None,
                 calltimeout=constants.SOCKET_TIMEOUT, filter_flag=False):
@@ -139,6 +154,7 @@ class RestClient(object):
                     "password": self.san_password,
                     "scope": "0"}
             self.init_http_head()
+            self.session.mount(item_url.lower(), HostNameIgnoringAdapter())
             result = self.do_call(url, data,
                                   calltimeout=constants.LOGIN_SOCKET_TIMEOUT,
                                   filter_flag=True)
@@ -386,8 +402,10 @@ class RestClient(object):
         return result['data']
 
     def get_lun_id(self, volume, volume_name):
-        lun_id = (volume.provider_location or
-                  self.get_lun_id_by_name(volume_name))
+        metadata = huawei_utils.get_lun_metadata(volume)
+        lun_id = (metadata.get('huawei_lun_id') or
+                      self.get_lun_id_by_name(volume_name))
+
         if not lun_id:
             msg = (_("Can't find lun info on the array. "
                      "volume: %(id)s, lun name: %(name)s.") %

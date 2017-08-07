@@ -79,12 +79,34 @@ class HuaweiConf(object):
                           self._lun_write_cache_policy,
                           self._storage_pools,
                           self._iscsi_default_target_ip,
-                          self._iscsi_info,)
+                          self._iscsi_info,
+                          self._ssl_cert_path,
+                          self._ssl_cert_verify,)
 
         tree = ET.parse(self.conf.cinder_huawei_conf_file)
         xml_root = tree.getroot()
         for f in set_attr_funcs:
             f(xml_root)
+
+    def _ssl_cert_path(self, xml_root):
+        text = xml_root.findtext('Storage/SSLCertPath')
+        if text:
+            setattr(self.conf, 'ssl_cert_path', text)
+        else:
+            setattr(self.conf, 'ssl_cert_path', None)
+
+    def _ssl_cert_verify(self, xml_root):
+        value = False
+        text = xml_root.findtext('Storage/SSLCertVerify')
+        if text:
+            if text.lower() in ('true', 'false'):
+                value = text.lower() == 'true'
+            else:
+                msg = _("SSLCertVerify configured error.")
+                LOG.error(msg)
+                raise exception.InvalidInput(reason=msg)
+
+        setattr(self.conf, 'ssl_cert_verify', value)
 
     def _san_address(self, xml_root):
         text = xml_root.findtext('Storage/RestURL')
