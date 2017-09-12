@@ -114,23 +114,22 @@ class RestClient(object):
 
         try:
             res = func(url, **kwargs)
-        except Exception as err:
+        except Exception as exc:
             LOG.exception(_LE('Bad response from server: %(url)s.'
-                              ' Error: %(err)s'), {'url': url, 'err': err})
-            json_msg = ('{"error":{"code": %s,"description": "Connect to '
-                        'server error."}}') % constants.ERROR_CONNECT_TO_SERVER
-            return json.loads(json_msg)
+                              ' Error: %(err)s'),
+                          {'url': url, 'err': six.text_type(exc)})
+            return {"error": {"code": constants.ERROR_CONNECT_TO_SERVER,
+                              "description": "Connect to server error."}
+                    }
         finally:
             self.semaphore.release()
 
         try:
             res.raise_for_status()
         except requests.HTTPError as exc:
-            json_msg = ('{"error":{"code": %(code)s,'
-                        '"description": "%(reason)s"}}'
-                        ) % {'code': exc.response.status_code,
-                             'reason': exc}
-            return json.loads(json_msg)
+            return {"error": {"code": exc.response.status_code,
+                              "description": six.text_type(exc)}
+                    }
 
         res_json = res.json()
         if not filter_flag:
@@ -500,13 +499,13 @@ class RestClient(object):
 
     def get_tgt_port_group(self, tgt_port_group):
         """Find target portgroup id by target port group name."""
-        url = "/portgroup?range=[0-8191]&TYPE=257"
+        url = "/portgroup?filter=NAME::%s" % tgt_port_group
         result = self.call(url, None, "GET")
 
         msg = _('Find portgroup error.')
         self._assert_rest_result(result, msg)
-
-        return self._get_id_from_result(result, tgt_port_group, 'NAME')
+        if 'data' in result and result['data']:
+            return result['data'][0]['ID']
 
     def _associate_portgroup_to_view(self, view_id, portgroup_id):
         url = "/MAPPINGVIEW/CREATE_ASSOCIATE"
@@ -730,14 +729,15 @@ class RestClient(object):
 
     def get_host_id_by_name(self, host_name):
         """Get the given host ID."""
-        url = "/host?range=[0-65535]"
+        url = "/host?filter=NAME::%s" % host_name
         result = self.call(url, None, "GET")
         self._assert_rest_result(result, _('Find host in hostgroup error.'))
 
-        return self._get_id_from_result(result, host_name, 'NAME')
+        if 'data' in result and result['data']:
+            return result['data'][0]['ID']
 
-    def add_host_with_check(self, host_name, host_name_before_hash):
-        host_id = self.get_host_id_by_name(host_name)
+    def add_host_with_check(self, host_name):
+        host_id = huawei_utils.get_host_id(self, host_name)
         if host_id:
             LOG.info(_LI(
                 'add_host_with_check. '
@@ -747,28 +747,29 @@ class RestClient(object):
                  'id': host_id})
             return host_id
 
+        encoded_name = huawei_utils.encode_host_name(host_name)
+
         try:
-            host_id = self._add_host(host_name, host_name_before_hash)
+            host_id = self._add_host(encoded_name, host_name)
         except Exception:
             LOG.info(_LI(
                 'Failed to create host: %(name)s. '
                 'Check if it exists on the array.'),
-                {'name': host_name})
-            host_id = self.get_host_id_by_name(host_name)
+                {'name': encoded_name})
+            host_id = self.get_host_id_by_name(encoded_name)
             if not host_id:
-                err_msg = (_(
-                    'Failed to create host: %(name)s. '
-                    'Please check if it exists on the array.'),
-                    {'name': host_name})
-                LOG.error(err_msg)
-                raise exception.VolumeBackendAPIException(data=err_msg)
+                msg = _('Failed to create host: %(name)s. '
+                        'Please check if it exists on the array.'
+                        ) % {'name': encoded_name}
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
 
         LOG.info(_LI(
             'add_host_with_check. '
             'create host success. '
             'host name: %(name)s, '
             'host id: %(id)s'),
-            {'name': host_name,
+            {'name': encoded_name,
              'id': host_id})
         return host_id
 
@@ -998,13 +999,14 @@ class RestClient(object):
         """Find mapping view."""
         if not name:
             return None
-        url = "/mappingview?range=[0-8191]"
+        url = "/mappingview?filter=NAME::%s" % name
         result = self.call(url, None, "GET")
 
         msg = _('Find mapping view error.')
         self._assert_rest_result(result, msg)
 
-        return self._get_id_from_result(result, name, 'NAME')
+        if 'data' in result and result['data']:
+            return result['data'][0]['ID']
 
     def _add_mapping_view(self, name):
         if not name:
@@ -1950,7 +1952,7 @@ class RestClient(object):
         # Just add, no need to check whether have been added.
         self.add_fc_port_to_host(host_id, initiator_name)
 
-    def get_fc_ports_on_array(self):
+    def get_fc_ports(self):
         url = '/fc_port'
         result = self.call(url, None, "GET")
         msg = _('Get FC ports from array error.')
@@ -1988,17 +1990,6 @@ class RestClient(object):
                     fc_initiators.append(item['ID'])
 
         return fc_initiators
-
-    def get_fc_ports_from_contr(self, contr):
-        port_list_from_contr = []
-        location = []
-        data = self.get_fc_ports_on_array()
-        for item in data:
-            location = item['PARENTID'].split('.')
-            if (location[0][1] == contr) and (item['RUNNINGSTATUS'] ==
-                                              constants.FC_PORT_CONNECTED):
-                port_list_from_contr.append(item['WWN'])
-        return port_list_from_contr
 
     def get_hyper_domain_id(self, domain_name):
         url = "/HyperMetroDomain?range=[0-32]"
@@ -2282,21 +2273,20 @@ class RestClient(object):
     def get_portgroup_by_view(self, view_id):
         if not view_id:
             return None
-        url = ("/portgroup/associate/mappingview?TYPE=257&ASSOCIATEOBJTYPE="
-               "245&ASSOCIATEOBJID=%s") % view_id
+        url = ("/portgroup/associate?ASSOCIATEOBJTYPE=245&"
+               "ASSOCIATEOBJID=%s") % view_id
         result = self.call(url, None, "GET")
         self._assert_rest_result(result, _('Get port group by view error.'))
-        return result.get("data", [])
+        if 'data' in result and result['data']:
+            return result['data'][0]['ID']
 
     def get_fc_ports_by_portgroup(self, portg_id):
-        ports = {}
-        if not portg_id:
-            return ports
-        url = ("/fc_port/associate/portgroup?TYPE=212&ASSOCIATEOBJTYPE=257"
+        url = ("/fc_port/associate?ASSOCIATEOBJTYPE=257"
                "&ASSOCIATEOBJID=%s") % portg_id
         result = self.call(url, None, "GET")
-        self._assert_rest_result(result, _('Get FC ports by port group '
-                                           'error.'))
+        self._assert_rest_result(
+            result, _('Get FC ports by port group error.'))
+        ports = {}
         for item in result.get("data", []):
             ports[item["WWN"]] = item["ID"]
         return ports
@@ -2332,13 +2322,6 @@ class RestClient(object):
         result = self.call(url, None, "DELETE")
         self._assert_rest_result(result, _('Remove port from port group'
                                            ' error.'))
-
-    def get_all_engines(self):
-        url = "/storageengine"
-        result = self.call(url, None, "GET")
-        self._assert_rest_result(result, _('Get engines error.'))
-
-        return result.get("data", [])
 
     def get_portg_info(self, portg_id):
         url = "/portgroup/%s" % portg_id

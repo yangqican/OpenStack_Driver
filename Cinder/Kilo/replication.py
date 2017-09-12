@@ -195,6 +195,9 @@ class ReplicaCG(object):
     def _get_group_info_by_name(self, group_id):
         group_name = huawei_utils.encode_name(group_id)
         group_info = self.local_cgop.get_replicg_by_name(group_name)
+        if not group_info:
+            group_name = huawei_utils.old_encode_name(group_id)
+            group_info = self.local_cgop.get_replicg_by_name(group_name)
         return group_info
 
     def split_replicg(self, group_info):

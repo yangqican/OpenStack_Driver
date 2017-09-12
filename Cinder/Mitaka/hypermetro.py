@@ -74,11 +74,13 @@ class HuaweiHyperMetro(object):
         except exception.VolumeBackendAPIException:
             raise
 
-    def delete_hypermetro(self, volume):
+    def delete_hypermetro(self, volume, metadata=None):
         """Delete hypermetro."""
-        metadata = huawei_utils.get_lun_metadata(volume)
-        metro_id = metadata['hypermetro_id']
-        remote_lun_id = metadata['remote_lun_id']
+        if not metadata:
+            metadata = huawei_utils.get_lun_metadata(volume)
+
+        metro_id = metadata.get('hypermetro_id')
+        remote_lun_id = metadata.get('remote_lun_id')
 
         # Delete hypermetro.
         if metro_id and self.client.check_hypermetro_exist(metro_id):
@@ -105,32 +107,24 @@ class HuaweiHyperMetro(object):
     def connect_volume_fc(self, volume, connector):
         """Create map between a volume and a host for FC."""
         wwns = connector['wwpns']
-        volume_name = huawei_utils.encode_name(volume.id)
-
         LOG.info(_LI(
             'initialize_connection_fc, initiator: %(wwpns)s,'
-            ' volume name: %(volume)s.'),
+            'volume id: %(id)s.'),
             {'wwpns': wwns,
-             'volume': volume_name})
+             'id': volume.id})
 
         metadata = huawei_utils.get_lun_metadata(volume)
-        lun_id = metadata['remote_lun_id']
-
+        lun_id = metadata.get('remote_lun_id')
         if lun_id is None:
-            lun_id = self.rmt_client.get_lun_id_by_name(volume_name)
-        if lun_id is None:
-            msg = _("Can't get volume id. Volume name: %s.") % volume_name
+            msg = _("Can't get volume id. Volume name: %s.") % volume.id
             LOG.error(msg)
             raise exception.VolumeBackendAPIException(data=msg)
 
         original_host_name = connector['host']
-        host_name = huawei_utils.encode_host_name(original_host_name)
-        host_id = self.client.add_host_with_check(host_name,
-                                                  original_host_name)
+        host_id = self.client.add_host_with_check(original_host_name)
 
         # Create hostgroup if not exist.
-        host_id = self.rmt_client.add_host_with_check(
-            host_name, original_host_name)
+        host_id = self.rmt_client.add_host_with_check(original_host_name)
 
         online_wwns_in_host = (
             self.rmt_client.get_host_online_fc_initiators(host_id))
@@ -187,23 +181,21 @@ class HuaweiHyperMetro(object):
     def disconnect_volume_fc(self, volume, connector):
         """Delete map between a volume and a host for FC."""
         wwns = connector['wwpns']
-        volume_name = huawei_utils.encode_name(volume.id)
         metadata = huawei_utils.get_lun_metadata(volume)
-        lun_id = metadata['remote_lun_id']
+        lun_id = metadata.get('remote_lun_id')
         host_name = connector['host']
         left_lunnum = -1
         lungroup_id = None
         view_id = None
 
-        LOG.info(_LI('terminate_connection_fc: volume name: %(volume)s, '
+        LOG.info(_LI('terminate_connection_fc: volume: %(id)s, '
                      'wwpns: %(wwns)s, '
                      'lun_id: %(lunid)s.'),
-                 {'volume': volume_name,
+                 {'id': volume.id,
                   'wwns': wwns,
                   'lunid': lun_id},)
 
-        host_name = huawei_utils.encode_host_name(host_name)
-        hostid = self.rmt_client.get_host_id_by_name(host_name)
+        hostid = huawei_utils.get_host_id(self.rmt_client, host_name)
         if hostid:
             mapping_view_name = constants.MAPPING_VIEW_PREFIX + hostid
             view_id = self.rmt_client.find_mapping_view(
@@ -229,7 +221,7 @@ class HuaweiHyperMetro(object):
         (tgt_port_wwns, init_targ_map) = (
             self.rmt_client.get_init_targ_map(wwns))
 
-        hostid = self.rmt_client.get_host_id_by_name(host_name)
+        hostid = huawei_utils.get_host_id(self.rmt_client, host_name)
         if hostid:
             mapping_view_name = constants.MAPPING_VIEW_PREFIX + hostid
             view_id = self.rmt_client.find_mapping_view(
@@ -281,7 +273,7 @@ class HuaweiHyperMetro(object):
             # Remove pair from metrogroup.
             for volume in volumes:
                 metadata = huawei_utils.get_lun_metadata(volume)
-                metro_id = metadata['hypermetro_id']
+                metro_id = metadata.get('hypermetro_id')
                 if metro_id and self.client.check_hypermetro_exist(metro_id):
                     if self._check_metro_in_cg(metro_id, metrogroup_id):
                         self.client.remove_metro_from_metrogroup(metrogroup_id,
@@ -293,6 +285,22 @@ class HuaweiHyperMetro(object):
 
             # Delete metrogroup.
             self.client.delete_metrogroup(metrogroup_id)
+
+    def _ensure_hypermetro_added_to_cg(self, metro_id, metrogroup_id):
+        def _check_added():
+            return self._check_metro_in_cg(metro_id, metrogroup_id)
+
+        huawei_utils.wait_for_condition(_check_added,
+                                        constants.DEFAULT_WAIT_INTERVAL,
+                                        constants.DEFAULT_WAIT_INTERVAL * 10)
+
+    def _ensure_hypermetro_removed_from_cg(self, metro_id, metrogroup_id):
+        def _check_removed():
+            return not self._check_metro_in_cg(metro_id, metrogroup_id)
+
+        huawei_utils.wait_for_condition(_check_removed,
+                                        constants.DEFAULT_WAIT_INTERVAL,
+                                        constants.DEFAULT_WAIT_INTERVAL * 10)
 
     def update_consistencygroup(self, context, group,
                                 add_volumes, remove_volumes):
@@ -306,12 +314,14 @@ class HuaweiHyperMetro(object):
             # Deal with add volumes to CG
             for volume in add_volumes:
                 metadata = huawei_utils.get_lun_metadata(volume)
-                metro_id = metadata['hypermetro_id']
+                metro_id = metadata.get('hypermetro_id')
                 if metro_id and self.client.check_hypermetro_exist(metro_id):
                     if not self._check_metro_in_cg(metro_id, metrogroup_id):
                         self.check_metro_need_to_stop(metro_id)
                         self.client.add_metro_to_metrogroup(metrogroup_id,
                                                             metro_id)
+                        self._ensure_hypermetro_added_to_cg(
+                            metro_id, metrogroup_id)
                 else:
                     err_msg = _("Hypermetro pair doesn't exist on array.")
                     LOG.error(err_msg)
@@ -320,12 +330,14 @@ class HuaweiHyperMetro(object):
             # Deal with remove volumes from CG
             for volume in remove_volumes:
                 metadata = huawei_utils.get_lun_metadata(volume)
-                metro_id = metadata['hypermetro_id']
+                metro_id = metadata.get('hypermetro_id')
                 if metro_id and self.client.check_hypermetro_exist(metro_id):
                     if self._check_metro_in_cg(metro_id, metrogroup_id):
                         self.check_metro_need_to_stop(metro_id)
                         self.client.remove_metro_from_metrogroup(metrogroup_id,
                                                                  metro_id)
+                        self._ensure_hypermetro_removed_from_cg(
+                            metro_id, metrogroup_id)
                         self.client.sync_hypermetro(metro_id)
                 else:
                     err_msg = _("Hypermetro pair doesn't exist on array.")
@@ -343,6 +355,21 @@ class HuaweiHyperMetro(object):
             LOG.error(msg)
             raise exception.VolumeBackendAPIException(data=msg)
 
+    def add_hypermetro_to_consistencygroup(self, group, metro_id):
+        metrogroup_id = self.check_consistencygroup_need_to_stop(group)
+        if metrogroup_id:
+            self.check_metro_need_to_stop(metro_id)
+            self.client.add_metro_to_metrogroup(metrogroup_id, metro_id)
+            self._ensure_hypermetro_added_to_cg(metro_id, metrogroup_id)
+            try:
+                self.client.sync_metrogroup(metrogroup_id)
+            except exception.VolumeBackendAPIException:
+                # Ignore this sync error.
+                LOG.warning(_LW('Resync metro group %(group)s failed '
+                                'after add new metro %(metro)s.'),
+                            {'group': metrogroup_id,
+                             'metro': metro_id})
+
     def check_metro_need_to_stop(self, metro_id):
         metro_info = self.client.get_hypermetro_by_id(metro_id)
         metro_health_status = metro_info['HEALTHSTATUS']
@@ -353,10 +380,18 @@ class HuaweiHyperMetro(object):
                 metro_running_status == constants.RUNNING_SYNC)):
             self.client.stop_hypermetro(metro_id)
 
-    def check_consistencygroup_need_to_stop(self, group):
-        group_name = huawei_utils.encode_name(group['id'])
+    def _get_metro_group_id(self, id):
+        group_name = huawei_utils.encode_name(id)
         metrogroup_id = self.client.get_metrogroup_by_name(group_name)
 
+        if not metrogroup_id:
+            group_name = huawei_utils.old_encode_name(id)
+            metrogroup_id = self.client.get_metrogroup_by_name(group_name)
+
+        return metrogroup_id
+
+    def check_consistencygroup_need_to_stop(self, group):
+        metrogroup_id = self._get_metro_group_id(group['id'])
         if metrogroup_id:
             metrogroup_info = self.client.get_metrogroup_by_id(metrogroup_id)
             health_status = metrogroup_info['HEALTHSTATUS']
