@@ -193,6 +193,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
             pool['thin_provisioning_support'] = True
             pool['smarttier'] = True
             pool['consistencygroup_support'] = True
+            pool['multiattach'] = True
 
             if self.configuration.san_product == "Dorado":
                 pool['smarttier'] = False
@@ -423,6 +424,13 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                 LOG.exception(_LE('Create replication volume error.'))
                 self._delete_lun_with_check(lun_id)
                 raise
+
+            if volume.consistencygroup_id:
+                replicg = replication.ReplicaCG(
+                    self.client, self.replica_client, self.configuration)
+                replicg.add_replica_to_group(
+                    volume.consistencygroup_id,
+                    replica_info['replication_driver_data'])
 
         return model_update
 

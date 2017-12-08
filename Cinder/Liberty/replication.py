@@ -100,6 +100,27 @@ class ReplicaCG(object):
             LOG.error(msg)
             raise exception.VolumeBackendAPIException(data=msg)
 
+    def add_replica_to_group(self, group_id, replica):
+        group_info = self._get_group_info_by_name(group_id)
+        if not group_info:
+            msg = _("The CG %s does not exist on array.") % group_id
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+
+        if group_info.get('ISPRIMARY') == 'false':
+            msg = _("The CG is not primary, can't operate cg.")
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+
+        replica_data = json.loads(replica)
+        pair_id = replica_data['pair_id']
+        replicg_id = group_info['ID']
+
+        self.split_replicg(group_info)
+        self.driver.split(pair_id)
+        self.local_cgop.add_pair_to_cg(replicg_id, pair_id)
+        self.local_cgop.sync_replicg(replicg_id)
+
     def failover(self, replicg_id):
         """Failover replicationcg.
 
@@ -118,10 +139,7 @@ class ReplicaCG(object):
         if running_status in sync_status_set:
             self.wait_replicg_ready(replicg_id)
 
-        if running_status != constants.REPLICG_STATUS_SPLITED:
-            self.rmt_cgop.split_replicg(replicg_id)
-            self.wait_split_ready(replicg_id)
-
+        self.split_replicg(info)
         self.rmt_cgop.set_cg_second_access(replicg_id,
                                            constants.REPLICA_SECOND_RW)
 
@@ -139,7 +157,6 @@ class ReplicaCG(object):
         self.failover(replicg_id)
         self.enable(replicg_id, self.rmt_cgop)
 
-
     def enable(self, replicg_id, client):
         info = client.get_replicg_info(replicg_id)
         running_status = info.get('RUNNINGSTATUS')
@@ -153,7 +170,6 @@ class ReplicaCG(object):
         client.set_cg_second_access(replicg_id, constants.REPLICA_SECOND_RO)
         client.sync_replicg(replicg_id)
         self.wait_replicg_ready(replicg_id)
-
 
     def _deal_add_volumes(self, replicg_id, add_volumes):
         for volume in add_volumes:
@@ -205,23 +221,24 @@ class ReplicaCG(object):
             return
 
         running_status = group_info.get('RUNNINGSTATUS')
-        replicg_id = group_info.get('ID')
-        status = (constants.REPLICG_STATUS_INTERRUPTED,
-                  constants.REPLICG_STATUS_SYNCING,
-                  constants.REPLICG_STATUS_TO_BE_RECOVERD,
-                  constants.REPLICG_STATUS_NORMAL)
-        if running_status in status:
-            self.local_cgop.split_replicg(replicg_id)
-            self.wait_split_ready(replicg_id)
-        elif running_status == constants.REPLICG_STATUS_INVALID:
+        if running_status == constants.REPLICG_STATUS_INVALID:
             err_msg = _("Replicg is invalid.")
             LOG.error(err_msg)
             raise exception.VolumeBackendAPIException(data=err_msg)
+        elif running_status in (constants.REPLICG_STATUS_INTERRUPTED,
+                                constants.REPLICG_STATUS_SPLITED):
+            return
+
+        replicg_id = group_info.get('ID')
+        self.rmt_cgop.split_replicg(replicg_id)
+        self.wait_split_ready(replicg_id)
 
     def wait_split_ready(self, replicg_id):
         def _check_state():
             info = self.rmt_cgop.get_replicg_info(replicg_id)
-            if info.get('RUNNINGSTATUS') == constants.REPLICG_STATUS_SPLITED:
+            if info.get('RUNNINGSTATUS') in (
+                    constants.REPLICG_STATUS_SPLITED,
+                    constants.REPLICG_STATUS_INTERRUPTED):
                 return True
             return False
 
