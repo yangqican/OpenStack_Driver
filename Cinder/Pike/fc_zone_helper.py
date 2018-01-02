@@ -13,6 +13,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import six
+
 from oslo_log import log as logging
 
 from cinder import exception
@@ -27,97 +29,51 @@ class FCZoneHelper(object):
     """FC zone helper for Huawei driver."""
 
     def __init__(self, fcsan_lookup_service, client):
-        self.fcsan = fcsan_lookup_service
+        self.fc_san = fcsan_lookup_service
         self.client = client
 
-    def _get_fc_ports_info(self):
-        ports_info = {}
+    def _get_online_fc_ports(self):
+        engine_map = {}
         contr_map = {}
+        slot_map = {}
+        port_map = {}
 
         fc_ports = self.client.get_fc_ports()
         for port in fc_ports:
             if port['RUNNINGSTATUS'] == constants.FC_PORT_CONNECTED:
-                location = port['PARENTID'].split('.')
-                port_info = {'id': port['ID'],
-                             'bandwidth': port['RUNSPEED'],
-                             'contr': location[0],
-                             'wwn': port['WWN']}
-                ports_info[port['WWN']] = port_info
+                location = port['LOCATION'].split('.')
+                engine = location[0]
+                contr = '.'.join(location[:2])
+                slot = '.'.join(location[:3])
+                port_wwn = port['WWN']
 
-                if location[0] not in contr_map:
-                    contr_map[location[0]] = [port['WWN']]
+                if engine not in engine_map:
+                    engine_map[engine] = [contr]
                 else:
-                    contr_map[location[0]].append(port['WWN'])
+                    engine_map[engine].append(contr)
 
-        return ports_info, contr_map
+                if contr not in contr_map:
+                    contr_map[contr] = [slot]
+                else:
+                    contr_map[contr].append(slot)
 
-    def _count_port_weight(self, port, ports_info):
-        LOG.debug("Count weight for port: %s.", port)
-        portgs = self.client.get_portgs_by_portid(ports_info[port]['id'])
-        LOG.debug("Port %(port)s belongs to PortGroup %(portgs)s.",
-                  {"port": port, "portgs": portgs})
-        weight = 0
-        for portg in portgs:
-            views = self.client.get_views_by_portg(portg)
-            if not views:
-                LOG.debug("PortGroup %s doesn't belong to any view.", portg)
-                continue
+                if slot not in slot_map:
+                    slot_map[slot] = [port_wwn]
+                else:
+                    slot_map[slot].append(port_wwn)
 
-            LOG.debug("PortGroup %(portg)s belongs to view %(views)s.",
-                      {"portg": portg, "views": views[0]})
-            # In fact, there is just one view for one port group.
-            lungroup = self.client.get_lungroup_by_view(views[0])
-            lun_num = self.client.get_obj_count_from_lungroup(lungroup)
-            ports_in_portg = self.client.get_ports_by_portg(portg)
-            LOG.debug("PortGroup %(portg)s contains ports: %(ports)s.",
-                      {"portg": portg, "ports": ports_in_portg})
-            total_bandwidth = 0
-            for port_pg in ports_in_portg:
-                if port_pg in ports_info:
-                    total_bandwidth += int(ports_info[port_pg]['bandwidth'])
+                port_map[port_wwn] = {
+                    'id': port['ID'],
+                    'runspeed': int(port['RUNSPEED']),
+                }
 
-            LOG.debug("Total bandwidth for PortGroup %(portg)s is %(bindw)s.",
-                      {"portg": portg, "bindw": total_bandwidth})
+        return engine_map, contr_map, slot_map, port_map
 
-            if total_bandwidth:
-                weight += float(lun_num) / float(total_bandwidth)
+    def _get_fabric(self, ini_port_wwns, tgt_port_wwns):
+        ini_tgt_map = self.fc_san.get_device_mapping_from_network(
+            ini_port_wwns, tgt_port_wwns)
 
-        bandwidth = float(ports_info[port]['bandwidth'])
-        return (weight, 10000 / bandwidth)
-
-    def _get_weighted_ports_per_contr(self, ports, ports_info):
-        port_weight_map = {}
-        for port in ports:
-            port_weight_map[port] = self._count_port_weight(port, ports_info)
-
-        LOG.debug("port_weight_map: %s", port_weight_map)
-        sorted_ports = sorted(port_weight_map.items(), key=lambda d: d[1])
-        weighted_ports = []
-        count = 0
-        for port in sorted_ports:
-            if count >= constants.PORT_NUM_PER_CONTR:
-                break
-            weighted_ports.append(port[0])
-            count += 1
-        return weighted_ports
-
-    def _get_weighted_ports(self, fabric_contrs, ports_info):
-        LOG.debug("select ports from controllers: %s", fabric_contrs)
-        weighted_ports = []
-        for k in fabric_contrs:
-            if len(fabric_contrs[k]) <= 2:
-                weighted_ports.extend(fabric_contrs[k])
-            else:
-                select_ports = self._get_weighted_ports_per_contr(
-                    fabric_contrs[k], ports_info)
-                weighted_ports.extend(select_ports)
-        return weighted_ports
-
-    def _filter_by_fabric(self, wwns, ports):
-        """Filter FC ports and initiators connected to fabrics."""
-        ini_tgt_map = self.fcsan.get_device_mapping_from_network(wwns, ports)
-
-        def _get_fabric_connection(fabric_name, fabric):
+        def _filter_not_connected_fabric(fabric_name, fabric):
             ini_port_wwn_list = fabric.get('initiator_port_wwn_list')
             tgt_port_wwn_list = fabric.get('target_port_wwn_list')
 
@@ -128,75 +84,184 @@ class FCZoneHelper(object):
                              'fabric': fabric})
                 return None
 
-            return ini_port_wwn_list, tgt_port_wwn_list
+            return [ini_port_wwn_list, tgt_port_wwn_list]
 
-        fabric_connected = []
+        valid_fabrics = []
         for fabric in ini_tgt_map:
-            ini_tgt_tuple = _get_fabric_connection(
-                fabric, ini_tgt_map[fabric])
+            pair = _filter_not_connected_fabric(fabric, ini_tgt_map[fabric])
+            if pair:
+                valid_fabrics.append(pair)
 
-            if ini_tgt_tuple:
-                fabric_connected.append(ini_tgt_tuple)
-
-        if not fabric_connected:
-            msg = _("No valid fabric connection from: %s.") % ini_tgt_map
+        if not valid_fabrics:
+            msg = _("No valid fabric connection: %s.") % ini_tgt_map
             LOG.error(msg)
             raise exception.VolumeBackendAPIException(data=msg)
 
-        LOG.info("Fabric connected: %s.", fabric_connected)
-        return fabric_connected
+        LOG.info("Got fabric: %s.", valid_fabrics)
+        return valid_fabrics
 
-    def build_ini_targ_map(self, wwns, host_id, lun_id):
-        ports_info, contr_map = self._get_fc_ports_info()
+    def _filter_fabric(self, fabrics, host_id):
+        host_initiators = self.client.get_host_fc_initiators(host_id)
+        for fabric in fabrics:
+            used_ini = set(fabric[0]) & set(host_initiators)
+            if len(used_ini) >= 2:
+                fabric[0] = list(used_ini)
+            elif len(used_ini) == 1:
+                others = list(set(fabric[0]) - used_ini)
+                fabric[0] = list(used_ini) + others[:1]
+            else:
+                fabric[0] = fabric[0][:2]
 
-        # Check if there is already a port group in the view.
-        view_name = constants.MAPPING_VIEW_PREFIX + host_id
-        portg_name = constants.PORTGROUP_PREFIX + host_id
+    def _get_used_ports(self, host_id):
+        portgroup_id = self.client.get_tgt_port_group(
+            constants.PORTGROUP_PREFIX + host_id)
+        if not portgroup_id:
+            return []
 
-        view_id = self.client.find_mapping_view(view_name)
-        portg_id = None
-        if view_id:
-            portg_id = self.client.get_portgroup_by_view(view_id)
-        if not portg_id:
-            portg_id = self.client.get_tgt_port_group(portg_name)
+        ports = self.client.get_ports_by_portg(portgroup_id)
+        return ports
 
-        exist_tgt_ports = []
-        if portg_id:
-            portg_ports = self.client.get_fc_ports_by_portgroup(portg_id)
-            exist_tgt_ports = list(portg_ports.keys())
+    def _count_port_weight(self, port, port_map):
+        port_bandwidth = port_map[port]['runspeed']
+        portgroup_ids = self.client.get_portgs_by_portid(
+            port_map[port]['id'])
+        return len(portgroup_ids), port_bandwidth
 
-        # Filter initiators and ports that connected to fabrics.
-        fabric_connected = self._filter_by_fabric(wwns, list(ports_info.keys()))
+    def _select_optimal_ports(self, ports, port_map, count):
+        if not ports or count <= 0:
+            return []
 
-        def _select_fabric_tgt_ports(fabric_tgt_ports):
-            new_ports = set(fabric_tgt_ports) - set(exist_tgt_ports)
-            fabric_contrs = {}
-            for k in contr_map:
-                fabric_contrs[k] = [port for port in contr_map[k]
-                                    if port in new_ports]
-            return self._get_weighted_ports(fabric_contrs, ports_info)
+        port_pairs = []
+        for port in ports:
+            weight = self._count_port_weight(port, port_map)
+            port_pairs.append((weight, port))
 
-        init_targ_map = {}
-        select_tgt_ports = []
-        for fabric in fabric_connected:
-            select_ports = _select_fabric_tgt_ports(fabric[1])
-            select_tgt_ports += select_ports
+        def _cmp(a, b):
+            if a[0] != b[0]:
+                return a[0] - b[0]
+            else:
+                return b[1] - a[1]
+
+        sorted_pairs = sorted(port_pairs, cmp=_cmp, key=lambda a: a[0])
+        return [pair[1] for pair in sorted_pairs[:count]]
+
+    def _select_ports_per_fabric(self, fabric_ports, slot_ports, port_map,
+                                 used_ports, count):
+        if count <= 0:
+            count = 1
+
+        selected_ports = set()
+        ports_in_use = set(fabric_ports) & set(slot_ports) & set(used_ports)
+        if len(ports_in_use) >= count:
+            selected_ports.update(ports_in_use)
+        else:
+            candid_ports = set(fabric_ports) & set(slot_ports) - ports_in_use
+            new_selects = self._select_optimal_ports(
+                candid_ports, port_map, count - len(ports_in_use))
+            selected_ports.update(ports_in_use)
+            selected_ports.update(new_selects)
+
+        return selected_ports
+
+    def _select_ports_per_slot(self, fabrics, slot_ports, port_map,
+                                used_ports, count):
+        count_left = count
+        selected_ports = set()
+
+        for fabric in fabrics:
+            ports = self._select_ports_per_fabric(
+                fabric[1], slot_ports, port_map, used_ports,
+                count_left // (len(fabrics) - fabrics.index(fabric))
+            )
+            selected_ports.update(ports)
+            count_left -= len(ports)
+
+        return selected_ports
+
+    def _select_ports_per_contr(self, fabrics, slots, slot_map, port_map,
+                                used_ports, count):
+        count_left = count
+        selected_ports = set()
+
+        for slot in slots:
+            ports = self._select_ports_per_slot(
+                fabrics, slot_map[slot], port_map, used_ports,
+                count_left // (len(slots) - slots.index(slot))
+            )
+            selected_ports.update(ports)
+            count_left -= len(ports)
+
+        return selected_ports
+
+    def _select_ports_per_engine(self, fabrics, contr_map, slot_map, port_map,
+                                 used_ports, count):
+        count_left = count
+        selected_ports = set()
+
+        contrs = sorted(contr_map, key=lambda i: len(contr_map[i]))
+        for contr in contrs:
+            ports = self._select_ports_per_contr(
+                fabrics, contr_map[contr], slot_map, port_map, used_ports,
+                count_left // (len(contrs) - contrs.index(contr))
+            )
+            selected_ports.update(ports)
+            count_left -= len(ports)
+
+        return selected_ports
+
+    def _get_fc_zone(self, wwns, host_id):
+        engine_map, contr_map, slot_map, port_map = self._get_online_fc_ports()
+
+        fabrics = self._get_fabric(wwns, list(port_map.keys()))
+        self._filter_fabric(fabrics, host_id)
+
+        count = constants.OPTIMAL_MULTIPATH_NUM // len(fabrics)
+        used_ports = self._get_used_ports(host_id)
+
+        selected_ports = set()
+        engines = [e for e in engine_map]
+        for eng in engines:
+            ports = self._select_ports_per_engine(
+                fabrics, contr_map, slot_map, port_map, used_ports,
+                count // (len(engines) - engines.index(eng))
+            )
+            selected_ports.update(ports)
+            count -= len(ports)
+
+        ini_tgt_map = {}
+        for fabric in fabrics:
+            new_ports = list(selected_ports & set(fabric[1]) - set(used_ports))
+            if not new_ports:
+                continue
             for ini in fabric[0]:
-                init_targ_map[ini] = select_ports
+                if ini not in ini_tgt_map:
+                    ini_tgt_map[ini] = new_ports
+                else:
+                    ini_tgt_map[ini].extend(new_ports)
 
-        if not portg_id:
-            portg_id = self.client.create_portg(portg_name)
+        return ini_tgt_map, selected_ports, port_map
 
-        for port in select_tgt_ports:
-            self.client.add_port_to_portg(portg_id, ports_info[port]['id'])
+    def build_ini_targ_map(self, wwns, host_id):
+        ini_tgt_map, total_ports, port_map = self._get_fc_zone(wwns, host_id)
 
-        total_tgt_wwns = select_tgt_ports + exist_tgt_ports
+        new_ports = set()
+        for v in six.itervalues(ini_tgt_map):
+            new_ports |= set(v)
+
+        portgroup_name = constants.PORTGROUP_PREFIX + host_id
+        portgroup_id = self.client.get_tgt_port_group(portgroup_name)
+        if not portgroup_id:
+            portgroup_id = self.client.create_portg(portgroup_name)
+
+        for port in new_ports:
+            self.client.add_port_to_portg(portgroup_id, port_map[port]['id'])
+
         LOG.debug("build_ini_targ_map: Port group name: %(portg_name)s, "
                   "init_targ_map: %(map)s, target_wwns: %(wwns)s.",
-                  {"portg_name": portg_name,
-                   "map": init_targ_map,
-                   "wwns": total_tgt_wwns})
-        return total_tgt_wwns, portg_id, init_targ_map
+                  {"portg_name": portgroup_name,
+                   "map": ini_tgt_map,
+                   "wwns": total_ports})
+        return list(total_ports), portgroup_id, ini_tgt_map
 
     def get_init_targ_map(self, wwns, host_id):
         error_ret = ([], None, {})

@@ -637,7 +637,6 @@ class HuaweiBaseDriver(driver.VolumeDriver):
         return {'_name_id': None,
                 'provider_location': huawei_utils.to_string(**new_metadata)}
 
-
     def migrate_volume(self, ctxt, volume, host, new_type=None):
         """Migrate a volume within the same array."""
         self._check_volume_exist_on_array(volume,
@@ -2588,7 +2587,7 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
             zone_helper = fc_zone_helper.FCZoneHelper(self.fcsan, self.client)
             try:
                 (tgt_port_wwns, portg_id, init_targ_map) = (
-                    zone_helper.build_ini_targ_map(wwns, host_id, lun_id))
+                    zone_helper.build_ini_targ_map(wwns, host_id))
             except Exception as err:
                 self.remove_host_with_check(host_id)
                 msg = _('build_ini_targ_map fails. %s') % err
@@ -2667,20 +2666,7 @@ class HuaweiFCDriver(HuaweiBaseDriver, driver.FibreChannelDriver):
             rmt_fc_info = hyperm.connect_volume_fc(volume, connector)
 
             rmt_tgt_wwn = rmt_fc_info['data']['target_wwn']
-            rmt_ini_tgt_map = rmt_fc_info['data']['initiator_target_map']
             fc_info['data']['target_wwn'] = (loc_tgt_wwn + rmt_tgt_wwn)
-            wwns = conn_wwpns
-            for wwn in wwns:
-                if (wwn in local_ini_tgt_map
-                        and wwn in rmt_ini_tgt_map):
-                    fc_info['data']['initiator_target_map'][wwn].extend(
-                        rmt_ini_tgt_map[wwn])
-
-                elif (wwn not in local_ini_tgt_map
-                        and wwn in rmt_ini_tgt_map):
-                    fc_info['data']['initiator_target_map'][wwn] = (
-                        rmt_ini_tgt_map[wwn])
-                # else, do nothing
 
             loc_map_info = fc_info['data']['map_info']
             rmt_map_info = rmt_fc_info['data']['map_info']

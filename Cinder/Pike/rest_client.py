@@ -65,7 +65,7 @@ class RestClient(object):
         self.ssl_cert_verify = self.configuration.ssl_cert_verify
         self.ssl_cert_path = self.configuration.ssl_cert_path
 
-        if not self.ssl_cert_verify:
+        if not self.ssl_cert_verify and hasattr(requests, 'packages'):
             LOG.warning("Suppressing requests library SSL Warnings")
             requests.packages.urllib3.disable_warnings(
                 requests.packages.urllib3.exceptions.InsecureRequestWarning)
@@ -1955,7 +1955,7 @@ class RestClient(object):
         msg = _('Get FC ports from array error.')
         self._assert_rest_result(result, msg)
 
-        return result['data']
+        return result.get('data', [])
 
     def get_fc_initiator_count(self):
         url = '/fc_initiator/count'
