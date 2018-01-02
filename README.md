@@ -1,4 +1,4 @@
 # OpenStack_Driver
 Cinder and Manila drivers for Huawei storage.
 
-Internal version: eSDK Storage Plugins 1.1.2
+Internal version: eSDK Storage Plugins 1.1.6
