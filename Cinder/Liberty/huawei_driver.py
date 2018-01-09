@@ -715,7 +715,7 @@ class HuaweiBaseDriver(driver.VolumeDriver):
                                   self.configuration.lun_policy)
 
         lun_params = {
-            'NAME': dst_volume_name,
+            'NAME': huawei_utils.encode_name(dst_volume_name),
             'PARENTID': pool_info['ID'],
             'DESCRIPTION': lun_info['DESCRIPTION'],
             'ALLOCTYPE': opts.get('LUNType', lun_info['ALLOCTYPE']),
