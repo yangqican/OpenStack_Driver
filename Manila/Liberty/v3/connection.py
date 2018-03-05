@@ -561,16 +561,8 @@ class V3StorageConnection(driver.HuaweiBase):
         resturl = root.findtext('Storage/RestURL')
         username = root.findtext('Storage/UserName')
         pwd = root.findtext('Storage/UserPassword')
-        product = root.findtext('Storage/Product')
         thin_pool_node = root.findtext('Filesystem/Thin_StoragePool')
         thick_pool_node = root.findtext('Filesystem/Thick_StoragePool')
-
-        if product != "V3":
-            err_msg = (_(
-                'check_conf_file: Config file invalid. '
-                'Product must be set to V3.'))
-            LOG.error(err_msg)
-            raise exception.InvalidInput(err_msg)
 
         if not (resturl and username and pwd):
             err_msg = (_(

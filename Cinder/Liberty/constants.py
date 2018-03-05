@@ -33,7 +33,6 @@ MAPPING_VIEW_PREFIX = 'OpenStack_Mapping_View_'
 PORTGROUP_PREFIX = 'OpenStack_PortGroup_'
 QOS_NAME_PREFIX = 'OpenStack_'
 PORTGROUP_DESCRIP_PREFIX = "Please do NOT modify this. Engine ID: "
-ARRAY_VERSION = 'V300R003C00'
 FC_PORT_CONNECTED = '10'
 FC_INIT_ONLINE = '27'
 FC_PORT_MODE_FABRIC = '0'
@@ -84,13 +83,8 @@ OS_TYPE = {'Linux': '0',
            'Mac OS X': '6',
            'VMware ESX': '7'}
 
-HUAWEI_VALID_KEYS = ['maxIOPS', 'minIOPS', 'minBandWidth',
-                     'maxBandWidth', 'latency', 'IOType']
-QOS_KEYS = [i.upper() for i in HUAWEI_VALID_KEYS]
-EXTRA_QOS_KEYS = ['MAXIOPS', 'MINIOPS', 'MINBANDWIDTH', 'MAXBANDWIDTH']
 LOWER_LIMIT_KEYS = ['MINIOPS', 'LATENCY', 'MINBANDWIDTH']
 UPPER_LIMIT_KEYS = ['MAXIOPS', 'MAXBANDWIDTH']
-MAX_LUN_NUM_IN_QOS = 64
 PWD_EXPIRED_OR_INITIAL = (3, 4)
 
 DEFAULT_REPLICA_WAIT_INTERVAL = 1
@@ -129,11 +123,7 @@ SNAPSHOT_NOT_EXISTS_RAISE = 'raise'
 LUN_TYPE_MAP = {'Thick': THICK_LUNTYPE,
                 'Thin': THIN_LUNTYPE}
 
-VALID_PRODUCT = ['T', 'TV2', 'V3', '18000', 'Dorado']
-PRODUCT_LUN_TYPE = {
-    'Dorado': 'Thin',
-}
-
+VALID_PRODUCT = ['T', 'TV2', 'V3', 'V5', '18000', 'Dorado']
 VALID_PROTOCOL = ['FC', 'iSCSI']
 VALID_WRITE_TYPE = ['1', '2']
 VOLUME_NOT_EXISTS_WARN = 'warning'

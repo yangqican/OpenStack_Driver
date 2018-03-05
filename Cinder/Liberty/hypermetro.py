@@ -146,8 +146,7 @@ class HuaweiHyperMetro(object):
                 raise exception.VolumeBackendAPIException(data=msg)
 
         for wwn in wwns:
-            if wwn in online_free_wwns:
-                self.rmt_client.add_fc_port_to_host(host_id, wwn)
+            self.rmt_client.ensure_fc_initiator_added(wwn, host_id)
 
         (tgt_port_wwns, init_targ_map) = (
             self.rmt_client.get_init_targ_map(wwns))
@@ -393,16 +392,19 @@ class HuaweiHyperMetro(object):
     def check_consistencygroup_need_to_stop(self, group):
         metrogroup_id = self._get_metro_group_id(group['id'])
         if metrogroup_id:
-            metrogroup_info = self.client.get_metrogroup_by_id(metrogroup_id)
-            health_status = metrogroup_info['HEALTHSTATUS']
-            running_status = metrogroup_info['RUNNINGSTATUS']
-
-            if (health_status == constants.HEALTH_NORMAL
-                and (running_status == constants.RUNNING_NORMAL
-                     or running_status == constants.RUNNING_SYNC)):
-                self.client.stop_metrogroup(metrogroup_id)
+            self.stop_consistencygroup(metrogroup_id)
 
         return metrogroup_id
+
+    def stop_consistencygroup(self, metrogroup_id):
+        metrogroup_info = self.client.get_metrogroup_by_id(metrogroup_id)
+        health_status = metrogroup_info['HEALTHSTATUS']
+        running_status = metrogroup_info['RUNNINGSTATUS']
+
+        if (health_status == constants.HEALTH_NORMAL
+            and (running_status == constants.RUNNING_NORMAL
+                 or running_status == constants.RUNNING_SYNC)):
+            self.client.stop_metrogroup(metrogroup_id)
 
     def _check_metro_in_cg(self, metro_id, cg_id):
         metro_info = self.client.get_hypermetro_by_id(metro_id)

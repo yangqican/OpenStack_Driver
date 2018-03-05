@@ -48,3 +48,8 @@ OPTS_ASSOCIATE = {
     'huawei_smartcache': 'cachename',
     'huawei_smartpartition': 'partitionname',
 }
+
+HUAWEI_UNIFIED_DRIVER_REGISTRY = {
+    'V3': 'manila.share.drivers.huawei.v3.connection.V3StorageConnection',
+    'V5': 'manila.share.drivers.huawei.v3.connection.V3StorageConnection',
+}

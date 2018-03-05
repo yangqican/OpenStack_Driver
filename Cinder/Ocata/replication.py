@@ -390,6 +390,7 @@ class PairOp(AbsReplicaOp):
     def check_pair_exist(self, pair_id):
         return self.client.check_pair_exist(pair_id)
 
+
 class CGOp(AbsReplicaOp):
     def create(self, group_name, group_id, replica_model):
         data = {'NAME': group_name,
@@ -701,20 +702,18 @@ class ReplicaPairManager(object):
 
     def build_rmt_lun_params(self, local_lun_info):
         params = {
-            'TYPE': '11',
             'NAME': local_lun_info['NAME'],
-            'PARENTTYPE': '216',
             'PARENTID': self.rmt_client.get_pool_id(self.rmt_pool),
             'DESCRIPTION': local_lun_info['DESCRIPTION'],
             'ALLOCTYPE': local_lun_info['ALLOCTYPE'],
             'CAPACITY': local_lun_info['CAPACITY'],
-            'WRITEPOLICY': self.conf.lun_write_type,
-            'PREFETCHPOLICY': self.conf.lun_prefetch_type,
-            'PREFETCHVALUE': self.conf.lun_prefetch_value,
-            'DATATRANSFERPOLICY': self.conf.lun_policy,
-            'READCACHEPOLICY': self.conf.lun_read_cache_policy,
-            'WRITECACHEPOLICY': self.conf.lun_write_cache_policy,
+            'WRITEPOLICY': local_lun_info['WRITEPOLICY'],
         }
+
+        for k in ('DATATRANSFERPOLICY', 'PREFETCHPOLICY', 'PREFETCHVALUE',
+                  'READCACHEPOLICY', 'WRITECACHEPOLICY'):
+            if k in local_lun_info:
+                params[k] = local_lun_info[k]
 
         LOG.debug('Remote lun params: %s.', params)
         return params
@@ -959,6 +958,9 @@ class ReplicaPairManager(object):
             volumes_update.append(v_update)
 
         return volumes_update
+
+    def split_replica(self, pair_id):
+        self.local_driver.split(pair_id)
 
 
 def get_replication_opts(opts):

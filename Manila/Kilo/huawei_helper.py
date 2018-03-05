@@ -685,10 +685,8 @@ class RestHelper():
         product = root.findtext('Storage/Product')
         pool_node = root.findall('Filesystem/StoragePool')
 
-        if product != "V3":
-            err_msg = (_(
-                '_check_conf_file: Config file invalid. '
-                'Product must be set to V3.'))
+        if product not in constants.VALID_PRODUCTS:
+            err_msg = _('_check_conf_file: Product is invalid.')
             LOG.error(err_msg)
             raise exception.InvalidInput(err_msg)
 

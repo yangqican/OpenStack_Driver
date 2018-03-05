@@ -84,16 +84,31 @@ OPTS_CAPABILITIES = {
     'compression': False,
     'huawei_smartcache': False,
     'huawei_smartpartition': False,
+    'huawei_controller': False,
     'thin_provisioning': None,
     'qos': False,
     'huawei_sectorsize': None,
+    'huawei_share_privillage': False,
 }
 
 OPTS_VALUE = {
     'cachename': None,
     'partitionname': None,
     'sectorsize': None,
+    'controllername': None,
+    'sync': None,
+    'allsquash': None,
+    'rootsquash': None,
+    'secure': None,
 }
+
+OPTS_PRIVILLAGE_VALUE = {
+    'sync': None,
+    'allsquash': None,
+    'rootsquash': None,
+    'secure': None
+}
+
 
 OPTS_VALUE.update(OPTS_QOS_VALUE)
 
@@ -102,6 +117,8 @@ OPTS_ASSOCIATE = {
     'huawei_smartpartition': 'partitionname',
     'huawei_sectorsize': 'sectorsize',
     'qos': OPTS_QOS_VALUE,
+    'huawei_controller': 'controllername',
+    'huawei_share_privillage': OPTS_PRIVILLAGE_VALUE,
 }
 
 VALID_SECTOR_SIZES = ('4', '8', '16', '32', '64')
@@ -142,3 +159,8 @@ REPLICA_SECONDARY_ACCESS_RIGHTS = (
     REPLICA_SECONDARY_ACCESS_DENIED,
     REPLICA_SECONDARY_RO,
     REPLICA_SECONDARY_RW) = ('1', '2', '3')
+
+HUAWEI_UNIFIED_DRIVER_REGISTRY = {
+    'V3': 'manila.share.drivers.huawei.v3.connection.V3StorageConnection',
+    'V5': 'manila.share.drivers.huawei.v3.connection.V3StorageConnection',
+}

@@ -111,6 +111,7 @@ class V3StorageConnection(driver.HuaweiBase):
                          'Reason: %(err)s.')
                        % {'name': share_name,
                           'err': err})
+            LOG.exception(message)
             raise exception.InvalidShare(reason=message)
 
         try:
@@ -297,7 +298,9 @@ class V3StorageConnection(driver.HuaweiBase):
                     dedupe=[True, False],
                     compression=[True, False],
                     huawei_smartcache=[True, False],
+                    huawei_controller=[True, False],
                     huawei_smartpartition=[True, False],
+                    huawei_share_privillage=[True, False],
                 )
                 stats_dict["pools"].append(pool)
 
@@ -631,6 +634,9 @@ class V3StorageConnection(driver.HuaweiBase):
                 LOG.error(err_msg)
                 raise exception.InvalidInput(reason=err_msg)
 
+        if extra_specs['controllerid']:
+            fileparam['OWNINGCONTROLLER'] = extra_specs['controllerid']
+
         return fileparam
 
     def deny_access(self, share, access, share_server=None):
@@ -665,6 +671,7 @@ class V3StorageConnection(driver.HuaweiBase):
 
     def allow_access(self, share, access, share_server=None):
         """Allow access to the share."""
+        share_type_id = share['share_type_id']
         share_proto = share['share_proto']
         share_name = share['name']
         share_url_type = self.helper._get_share_url_type(share_proto)
@@ -724,8 +731,8 @@ class V3StorageConnection(driver.HuaweiBase):
                                                 share_proto, access_level)
         else:
             # Add this access to share
-            self.helper._allow_access_rest(share_id, access_to,
-                                           share_proto, access_level)
+            self.helper._allow_access_rest(
+                share_id, access_to, share_proto, access_level, share_type_id)
 
     def clear_access(self, share, share_server=None):
         """Remove all access rules of the share"""
@@ -1114,16 +1121,8 @@ class V3StorageConnection(driver.HuaweiBase):
         resturl = root.findtext('Storage/RestURL')
         username = root.findtext('Storage/UserName')
         pwd = root.findtext('Storage/UserPassword')
-        product = root.findtext('Storage/Product')
         pool_node = root.findtext('Filesystem/StoragePool')
         logical_port_ip = root.findtext('Storage/LogicalPortIP')
-
-        if product != "V3":
-            err_msg = (_(
-                'check_conf_file: Config file invalid. '
-                'Product must be set to V3.'))
-            LOG.error(err_msg)
-            raise exception.InvalidInput(err_msg)
 
         if not (resturl and username and pwd):
             err_msg = (_(

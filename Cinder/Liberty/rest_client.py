@@ -16,7 +16,6 @@
 import json
 import netaddr
 import requests
-from requests.adapters import HTTPAdapter
 import six
 import threading
 import time
@@ -24,6 +23,7 @@ import time
 from oslo_concurrency import lockutils
 from oslo_log import log as logging
 from oslo_utils import excutils
+from requests.adapters import HTTPAdapter
 
 from cinder import exception
 from cinder.i18n import _, _LE, _LI, _LW
@@ -54,6 +54,7 @@ class RestClient(object):
                                         self.configuration.storage_pools)
         self.iscsi_info = kwargs.get('iscsi_info',
                                      self.configuration.iscsi_info)
+        self.fc_info = kwargs.get('fc_info', self.configuration.fc_info)
         self.iscsi_default_target_ip = kwargs.get(
             'iscsi_default_target_ip',
             self.configuration.iscsi_default_target_ip)
@@ -600,8 +601,11 @@ class RestClient(object):
         if not added:
             self._add_initiator_to_array(initiator_name)
         if not self.is_initiator_associated_to_host(initiator_name, host_id):
-            self._associate_initiator_to_host(initiator_name,
-                                              host_id)
+            self._associate_initiator_to_host(initiator_name, host_id)
+
+        alua_info = self._find_alua_info(self.iscsi_info, initiator_name)
+        LOG.info('Use ALUA %s when adding initiator to host.', alua_info)
+        self._use_iscsi_alua(initiator_name, alua_info)
 
     def find_hostgroup(self, groupname):
         """Get the given hostgroup id."""
@@ -916,19 +920,12 @@ class RestClient(object):
                                      initiator_name,
                                      host_id):
         """Associate initiator with the host."""
-        chapinfo = self.find_chap_info(self.iscsi_info,
-                                       initiator_name)
-        multipath_type = self._find_alua_info(self.iscsi_info,
-                                              initiator_name)
+        chapinfo = self.find_chap_info(self.iscsi_info, initiator_name)
         if chapinfo:
             LOG.info(_LI('Use CHAP when adding initiator to host.'))
             self._use_chap(chapinfo, initiator_name, host_id)
         else:
             self._add_initiator_to_host(initiator_name, host_id)
-
-        if multipath_type:
-            LOG.info(_LI('Use ALUA when adding initiator to host.'))
-            self._use_alua(initiator_name, multipath_type)
 
     def find_chap_info(self, iscsi_info, initiator_name):
         """Find CHAP info from xml."""
@@ -941,22 +938,27 @@ class RestClient(object):
 
         return chapinfo
 
-    def _find_alua_info(self, iscsi_info, initiator_name):
+    def _find_alua_info(self, config, initiator_name):
         """Find ALUA info from xml."""
-        multipath_type = 0
-        for ini in iscsi_info:
-            if ini['Name'] == initiator_name:
+        alua_info = {'ALUA': '0'}
+        for ini in config:
+            if ini.get('Name') == initiator_name:
                 if 'ALUA' in ini:
-                    if ini['ALUA'] != '1' and ini['ALUA'] != '0':
-                        msg = (_(
-                            'Invalid ALUA value. '
-                            'ALUA value must be 1 or 0.'))
-                        LOG.error(msg)
-                        raise exception.InvalidInput(msg)
-                    else:
-                        multipath_type = ini['ALUA']
-                        break
-        return multipath_type
+                    alua_info['ALUA'] = ini['ALUA']
+
+                if alua_info['ALUA'] not in ('0', '1'):
+                    msg = _('Invalid ALUA value. ALUA value must be 1 or 0.')
+                    LOG.error(msg)
+                    raise exception.InvalidInput(msg)
+
+                if alua_info['ALUA'] == '1':
+                    for k in ('FAILOVERMODE', 'SPECIALMODETYPE', 'PATHTYPE'):
+                        if k in ini:
+                            alua_info[k] = ini[k]
+
+                break
+
+        return alua_info
 
     def _use_chap(self, chapinfo, initiator_name, host_id):
         """Use CHAP when adding initiator to host."""
@@ -975,13 +977,14 @@ class RestClient(object):
                 'Please check the CHAP username and password.')
         self._assert_rest_result(result, msg)
 
-    def _use_alua(self, initiator_name, multipath_type):
+    def _use_iscsi_alua(self, initiator_name, alua_info):
         """Use ALUA when adding initiator to host."""
         url = "/iscsi_initiator"
         data = {"ID": initiator_name,
-                "MULTIPATHTYPE": multipath_type}
-        result = self.call(url, data, "PUT")
+                'MULTIPATHTYPE': alua_info.pop('ALUA')}
+        data.update(alua_info)
 
+        result = self.call(url, data, "PUT")
         self._assert_rest_result(
             result, _('Use ALUA to associate initiator to host error.'))
 
@@ -989,8 +992,8 @@ class RestClient(object):
         """Remove CHAP when terminate connection."""
         url = "/iscsi_initiator"
         data = {"USECHAP": "false",
-                           "MULTIPATHTYPE": "0",
-                           "ID": initiator_name}
+                "MULTIPATHTYPE": "0",
+                "ID": initiator_name}
         result = self.call(url, data, "PUT")
 
         self._assert_rest_result(result, _('Remove CHAP error.'))
@@ -1229,11 +1232,19 @@ class RestClient(object):
 
         return wwns
 
+    def _use_fc_alua(self, wwn, alua_info):
+        url = "/fc_initiator/" + wwn
+        data = {"ID": wwn,
+                "MULTIPATHTYPE": alua_info.pop('ALUA')}
+        data.update(alua_info)
+
+        result = self.call(url, data, "PUT")
+        self._assert_rest_result(result, _('Set ALUA for fc initiator error.'))
+
     def add_fc_port_to_host(self, host_id, wwn):
         """Add a FC port to the host."""
         url = "/fc_initiator/" + wwn
-        data = {"TYPE": "223",
-                "ID": wwn,
+        data = {"ID": wwn,
                 "PARENTTYPE": 21,
                 "PARENTID": host_id}
         result = self.call(url, data, "PUT")
@@ -1605,7 +1616,7 @@ class RestClient(object):
 
         return lungroup_ids
 
-    def get_lun_info(self, lun_id, lun_type = constants.LUN_TYPE):
+    def get_lun_info(self, lun_id, lun_type=constants.LUN_TYPE):
         cmd_type = 'lun' if lun_type == constants.LUN_TYPE else 'snapshot'
         url = ("/%s/%s" % (cmd_type, lun_id))
         result = self.call(url, None, "GET")
@@ -1729,48 +1740,6 @@ class RestClient(object):
         self._assert_rest_result(result, _('Get QoS information error.'))
         return result
 
-    def find_available_qos(self, qos):
-        """"Find available QoS on the array."""
-        qos_id = None
-        lun_list = []
-        extra_qos = [i for i in constants.EXTRA_QOS_KEYS if i not in qos]
-        result = self.get_qos()
-
-        if 'data' in result:
-            for items in result['data']:
-                qos_flag = 0
-                extra_flag = False
-                if 'LATENCY' not in qos and items['LATENCY'] != '0':
-                    extra_flag = True
-                else:
-                    for item in items:
-                        if item in extra_qos:
-                            extra_flag = True
-                            break
-                for key in qos:
-                    if key not in items:
-                        break
-                    elif qos[key] != items[key]:
-                        break
-                    qos_flag = qos_flag + 1
-                lun_num = len(items['LUNLIST'].split(","))
-                qos_name = items['NAME']
-                qos_status = items['RUNNINGSTATUS']
-                # We use this QoS only if the LUNs in it is less than 64,
-                # created by OpenStack and does not contain filesystem,
-                # else we cannot add LUN to this QoS any more.
-                if (qos_flag == len(qos)
-                        and not extra_flag
-                        and lun_num < constants.MAX_LUN_NUM_IN_QOS
-                        and qos_name.startswith(constants.QOS_NAME_PREFIX)
-                        and qos_status == constants.STATUS_QOS_ACTIVE
-                        and items['FSLIST'] == '[""]'):
-                    qos_id = items['ID']
-                    lun_list = items['LUNLIST']
-                    break
-
-        return (qos_id, lun_list)
-
     def add_lun_to_qos(self, qos_id, lun_id, lun_list):
         """Add lun to QoS."""
         url = "/ioclass/" + qos_id
@@ -1806,10 +1775,6 @@ class RestClient(object):
         result = self.call(url, None, "GET", filter_flag=True)
         self._assert_rest_result(result, _('Get array info error.'))
         return result.get('data', None)
-
-    def find_array_version(self):
-        info = self.get_array_info()
-        return info.get('PRODUCTVERSION', None)
 
     def remove_host(self, host_id):
         url = "/host/%s" % host_id
@@ -1951,6 +1916,10 @@ class RestClient(object):
             self._add_fc_initiator_to_array(initiator_name)
         # Just add, no need to check whether have been added.
         self.add_fc_port_to_host(host_id, initiator_name)
+
+        alua_info = self._find_alua_info(self.fc_info, initiator_name)
+        LOG.info('Use ALUA %s when adding initiator to host.', alua_info)
+        self._use_fc_alua(initiator_name, alua_info)
 
     def get_fc_ports(self):
         url = '/fc_port'
@@ -2562,3 +2531,16 @@ class RestClient(object):
                % {'group': replicg_id})
         self._assert_rest_result(result, msg)
 
+    def get_controller_by_name(self, name):
+        controlers = self._get_all_controllers()
+        for controller in controlers:
+            if controller.get('LOCATION') == name:
+                return controller.get('ID')
+
+        return None
+
+    def _get_all_controllers(self):
+        url = "/controller"
+        result = self.call(url, None, "GET")
+        self._assert_rest_result(result, _('Get all controller error.'))
+        return result.get('data', [])

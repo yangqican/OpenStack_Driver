@@ -23,10 +23,7 @@ from oslo_utils import importutils
 from manila import exception
 from manila.i18n import _
 from manila.share import driver
-
-
-HUAWEI_UNIFIED_DRIVER_REGISTRY = {
-    'V3': 'manila.share.drivers.huawei.v3.connection.V3StorageConnection', }
+from manila.share.drivers.huawei import constants
 
 
 huawei_opts = [
@@ -91,11 +88,15 @@ class HuaweiNasDriver(driver.ShareDriver):
             LOG.error(message)
             raise exception.InvalidInput(reason=message)
         product = root.findtext('Storage/Product')
-        backend_driver = HUAWEI_UNIFIED_DRIVER_REGISTRY.get(product)
+        backend_driver = constants.HUAWEI_UNIFIED_DRIVER_REGISTRY.get(product)
         if backend_driver is None:
-            raise exception.InvalidInput(
-                reason=_('Product %s is not supported. Product '
-                         'must be set to V3.') % product)
+            msg = _('Product %(product)s is not supported. Product '
+                    'must be set to one of %(valid)s.'
+                    ) % {
+                      'product': product,
+                      'valid': list(constants.HUAWEI_UNIFIED_DRIVER_REGISTRY),
+                  }
+            raise exception.InvalidInput(reason=msg)
 
         return backend_driver
 

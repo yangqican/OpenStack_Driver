@@ -26,6 +26,7 @@ import six
 from manila import exception
 from manila.i18n import _
 from manila.share.drivers.huawei import constants
+from manila.share.drivers.huawei import huawei_utils
 from manila import utils
 
 LOG = log.getLogger(__name__)
@@ -454,10 +455,11 @@ class RestHelper(object):
         self._assert_rest_result(result, msg)
 
     def _allow_access_rest(self, share_id, access_to,
-                           share_proto, access_level):
+                           share_proto, access_level, share_type_id):
         """Allow access to the share."""
         if share_proto == 'NFS':
-            self._allow_nfs_access_rest(share_id, access_to, access_level)
+            self._allow_nfs_access_rest(share_id, access_to, access_level,
+                                        share_type_id)
         elif share_proto == 'CIFS':
             self._allow_cifs_access_rest(share_id, access_to, access_level)
         else:
@@ -465,7 +467,8 @@ class RestHelper(object):
                 reason=(_('Invalid NAS protocol supplied: %s.')
                         % share_proto))
 
-    def _allow_nfs_access_rest(self, share_id, access_to, access_level):
+    def _allow_nfs_access_rest(self, share_id, access_to, access_level,
+                               share_type_id=None):
         url = "/NFS_SHARE_AUTH_CLIENT"
         access = {
             "TYPE": "16409",
@@ -476,6 +479,19 @@ class RestHelper(object):
             "ALLSQUASH": "1",
             "ROOTSQUASH": "0",
         }
+
+        if share_type_id:
+            specs = huawei_utils.get_share_extra_specs_params(share_type_id)
+            if specs:
+                if specs.get('sync'):
+                    access['SYNC'] = specs['sync']
+                if specs.get('allsquash'):
+                    access['ALLSQUASH'] = specs['allsquash']
+                if specs.get('rootsquash'):
+                    access['ROOTSQUASH'] = specs['rootsquash']
+                if specs.get('secure'):
+                    access['SECURE'] = specs['secure']
+
         data = jsonutils.dumps(access)
         result = self.call(url, data, "POST")
 
@@ -1421,3 +1437,17 @@ class RestHelper(object):
 
         msg = _('Failed to rollback snapshot %s.') % snap_id
         self._assert_rest_result(result, msg)
+
+    def get_controller_by_name(self, name):
+        controlers = self._get_all_controllers()
+        for controller in controlers:
+            if controller.get('LOCATION') == name:
+                return controller.get('ID')
+
+        return None
+
+    def _get_all_controllers(self):
+        url = "/controller"
+        result = self.call(url, None, "GET")
+        self._assert_rest_result(result, _('Get all controller error.'))
+        return result.get('data', [])

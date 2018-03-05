@@ -43,23 +43,23 @@ class FCZoneHelper(object):
             if port['RUNNINGSTATUS'] == constants.FC_PORT_CONNECTED:
                 location = port['LOCATION'].split('.')
                 engine = location[0]
-                contr = '.'.join(location[:2])
-                slot = '.'.join(location[:3])
+                contr = port['PARENTID'].split('.')[0]
+                slot = port['PARENTID']
                 port_wwn = port['WWN']
 
                 if engine not in engine_map:
                     engine_map[engine] = [contr]
-                else:
+                elif contr not in engine_map[engine]:
                     engine_map[engine].append(contr)
 
                 if contr not in contr_map:
                     contr_map[contr] = [slot]
-                else:
+                elif slot not in contr_map[contr]:
                     contr_map[contr].append(slot)
 
                 if slot not in slot_map:
                     slot_map[slot] = [port_wwn]
-                else:
+                elif port_wwn not in slot_map[slot]:
                     slot_map[slot].append(port_wwn)
 
                 port_map[port_wwn] = {

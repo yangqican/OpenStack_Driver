@@ -74,12 +74,10 @@ class HuaweiConf(object):
                           self._lun_timeout,
                           self._lun_write_type,
                           self._lun_prefetch,
-                          self._lun_policy,
-                          self._lun_read_cache_policy,
-                          self._lun_write_cache_policy,
                           self._storage_pools,
                           self._iscsi_default_target_ip,
                           self._iscsi_info,
+                          self._fc_info,
                           self._ssl_cert_path,
                           self._ssl_cert_verify,)
 
@@ -139,6 +137,25 @@ class HuaweiConf(object):
         pwd = base64.b64decode(text[4:])
         setattr(self.conf, 'san_password', pwd)
 
+    def _set_extra_constants_by_product(self, product):
+        extra_constants = {}
+        if product == 'Dorado':
+            extra_constants['QOS_SPEC_KEYS'] = (
+                'maxIOPS', 'maxBandWidth', 'IOType')
+            extra_constants['QOS_IOTYPES'] = ('2',)
+            extra_constants['SUPPORT_LUN_TYPES'] = ('Thin',)
+            extra_constants['DEFAULT_LUN_TYPE'] = 'Thin'
+        else:
+            extra_constants['QOS_SPEC_KEYS'] = (
+                'maxIOPS', 'minIOPS', 'minBandWidth',
+                'maxBandWidth', 'latency', 'IOType')
+            extra_constants['QOS_IOTYPES'] = ('0', '1', '2')
+            extra_constants['SUPPORT_LUN_TYPES'] = ('Thick', 'Thin')
+            extra_constants['DEFAULT_LUN_TYPE'] = 'Thick'
+
+        for k in extra_constants:
+            setattr(constants, k, extra_constants[k])
+
     def _san_product(self, xml_root):
         text = xml_root.findtext('Storage/Product')
         if not text:
@@ -146,14 +163,15 @@ class HuaweiConf(object):
             LOG.error(msg)
             raise exception.InvalidInput(reason=msg)
 
-        if text not in constants.VALID_PRODUCT:
+        product = text.strip()
+        if product not in constants.VALID_PRODUCT:
             msg = (_("Invalid SAN product '%(text)s', SAN product must be in "
                      "%(valid)s.")
-                   % {'text': text, 'valid': constants.VALID_PRODUCT})
+                   % {'text': product, 'valid': constants.VALID_PRODUCT})
             LOG.error(msg)
             raise exception.InvalidInput(reason=msg)
 
-        product = text.strip()
+        self._set_extra_constants_by_product(product)
         setattr(self.conf, 'san_product', product)
 
     def _san_protocol(self, xml_root):
@@ -174,36 +192,25 @@ class HuaweiConf(object):
         setattr(self.conf, 'san_protocol', protocol)
 
     def _lun_type(self, xml_root):
-        if self.conf.san_product in constants.PRODUCT_LUN_TYPE:
-            lun_type = constants.PRODUCT_LUN_TYPE[self.conf.san_product]
-        else:
-            lun_type = 'Thick'
-
-        def _verify_conf_lun_type(lun_type):
+        lun_type = constants.DEFAULT_LUN_TYPE
+        text = xml_root.findtext('LUN/LUNType')
+        if text:
+            lun_type = text.strip()
             if lun_type not in constants.LUN_TYPE_MAP:
                 msg = _("Invalid lun type %s is configured.") % lun_type
                 LOG.error(msg)
                 raise exception.InvalidInput(reason=msg)
 
-            if self.conf.san_product in constants.PRODUCT_LUN_TYPE:
-                product_lun_type = constants.PRODUCT_LUN_TYPE[
-                    self.conf.san_product]
-                if lun_type != product_lun_type:
-                    msg = _("%(array)s array requires %(valid)s lun type, "
-                            "but %(conf)s is specified.") % {
-                              'array': self.conf.san_product,
-                              'valid': product_lun_type,
-                              'conf': lun_type}
-                    LOG.error(msg)
-                    raise exception.InvalidInput(reason=msg)
+            if lun_type not in constants.SUPPORT_LUN_TYPES:
+                msg = _("%(array)s array requires %(valid)s lun type, "
+                        "but %(conf)s is specified."
+                        ) % {'array': self.conf.san_product,
+                             'valid': constants.SUPPORT_LUN_TYPES,
+                             'conf': lun_type}
+                LOG.error(msg)
+                raise exception.InvalidInput(reason=msg)
 
-        text = xml_root.findtext('LUN/LUNType')
-        if text:
-            lun_type = text.strip()
-            _verify_conf_lun_type(lun_type)
-
-        lun_type = constants.LUN_TYPE_MAP[lun_type]
-        setattr(self.conf, 'lun_type', lun_type)
+        setattr(self.conf, 'lun_type', constants.LUN_TYPE_MAP[lun_type])
 
     def _lun_ready_wait_interval(self, xml_root):
         text = xml_root.findtext('LUN/LUNReadyWaitInterval')
@@ -281,15 +288,6 @@ class HuaweiConf(object):
         setattr(self.conf, 'lun_prefetch_type', prefetch_type)
         setattr(self.conf, 'lun_prefetch_value', prefetch_value)
 
-    def _lun_policy(self, xml_root):
-        setattr(self.conf, 'lun_policy', '0')
-
-    def _lun_read_cache_policy(self, xml_root):
-        setattr(self.conf, 'lun_read_cache_policy', '2')
-
-    def _lun_write_cache_policy(self, xml_root):
-        setattr(self.conf, 'lun_write_cache_policy', '5')
-
     def _storage_pools(self, xml_root):
         nodes = xml_root.findall('LUN/StoragePool')
         if not nodes:
@@ -327,6 +325,22 @@ class HuaweiConf(object):
             iscsi_info.append(props)
 
         setattr(self.conf, 'iscsi_info', iscsi_info)
+
+    def _fc_info(self, xml_root):
+        nodes = xml_root.findall('FC/Initiator')
+        if nodes is None:
+            setattr(self.conf, 'fc_info', [])
+            return
+
+        fc_info = []
+        for node in nodes:
+            props = {}
+            for item in node.items():
+                props[item[0].strip()] = item[1].strip()
+
+            fc_info.append(props)
+
+        setattr(self.conf, 'fc_info', fc_info)
 
     def _parse_rmt_iscsi_info(self, iscsi_info):
         if not (iscsi_info and iscsi_info.strip()):
@@ -387,6 +401,8 @@ class HuaweiConf(object):
             dev_config['storage_pools'] = dev['storage_pool'].split(';')
             dev_config['iscsi_info'] = self._parse_rmt_iscsi_info(
                 dev.get('iscsi_info'))
+            dev_config['fc_info'] = self._parse_rmt_iscsi_info(
+                dev.get('fc_info'))
             dev_config['iscsi_default_target_ip'] = (
                 dev['iscsi_default_target_ip'].split(';')
                 if 'iscsi_default_target_ip' in dev
@@ -410,6 +426,8 @@ class HuaweiConf(object):
             dev_config['storage_pools'] = dev['storage_pool'].split(';')
             dev_config['iscsi_info'] = self._parse_rmt_iscsi_info(
                 dev.get('iscsi_info'))
+            dev_config['fc_info'] = self._parse_rmt_iscsi_info(
+                dev.get('fc_info'))
             dev_config['iscsi_default_target_ip'] = (
                 dev['iscsi_default_target_ip'].split(';')
                 if 'iscsi_default_target_ip' in dev
@@ -426,6 +444,7 @@ class HuaweiConf(object):
             'san_password': self.conf.san_password,
             'storage_pools': self.conf.storage_pools,
             'iscsi_info': self.conf.iscsi_info,
+            'fc_info': self.conf.fc_info,
             'iscsi_default_target_ip': self.conf.iscsi_default_target_ip,
         }
         return dev_config

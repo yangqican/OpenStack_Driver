@@ -43,7 +43,6 @@ class SmartQos(object):
             return {}
 
         qos = {}
-        io_type_flag = None
         ctxt = context.get_admin_context()
         consumer = qos_specs.get_qos_specs(ctxt, qos_specs_id)['consumer']
         if consumer == 'front-end':
@@ -51,34 +50,28 @@ class SmartQos(object):
 
         kvs = qos_specs.get_qos_specs(ctxt, qos_specs_id)['specs']
         LOG.info('The QoS sepcs is: %s.', kvs)
+
         for k, v in kvs.items():
-            if k not in constants.HUAWEI_VALID_KEYS:
-                continue
+            if k not in constants.QOS_SPEC_KEYS:
+                msg = _('Invalid QoS %s specification.') % k
+                LOG.error(msg)
+                raise exception.InvalidInput(reason=msg)
+
             if k != 'IOType' and int(v) <= 0:
                 msg = _('QoS config is wrong. %s must > 0.') % k
                 LOG.error(msg)
                 raise exception.InvalidInput(reason=msg)
-            if k == 'IOType':
-                if v not in ['0', '1', '2']:
-                    msg = _('Illegal value specified for IOTYPE: 0, 1, or 2.')
-                    LOG.error(msg)
-                    raise exception.InvalidInput(reason=msg)
-                io_type_flag = 1
-                qos[k.upper()] = v
-            else:
-                qos[k.upper()] = v
 
-        if not io_type_flag:
-            msg = (_('QoS policy must specify for IOTYPE: 0, 1, or 2, '
-                     'QoS policy: %(qos_policy)s ') % {'qos_policy': qos})
+            qos[k.upper()] = v
+
+        if 'IOTYPE' not in qos or qos['IOTYPE'] not in constants.QOS_IOTYPES:
+            msg = _('IOType value must be in %(valid)s.'
+                    ) % {'valid': constants.QOS_IOTYPES}
             LOG.error(msg)
             raise exception.InvalidInput(reason=msg)
 
-        # QoS policy must specify for IOTYPE and another qos_specs.
         if len(qos) < 2:
-            msg = (_('QoS policy must specify for IOTYPE and another '
-                     'qos_specs, QoS policy: %(qos_policy)s.')
-                   % {'qos_policy': qos})
+            msg = _('QoS policy must specify IOType and one of QoS specs.')
             LOG.error(msg)
             raise exception.InvalidInput(reason=msg)
 
@@ -109,17 +102,8 @@ class SmartQos(object):
             if self._is_high_priority(qos):
                 self.client.change_lun_priority(lun_id)
             # Create QoS policy and activate it.
-            version = self.client.find_array_version()
-            if version >= constants.ARRAY_VERSION:
-                (qos_id, lun_list) = self.client.find_available_qos(qos)
-                if qos_id:
-                    self.client.add_lun_to_qos(qos_id, lun_id, lun_list)
-                else:
-                    policy_id = self.client.create_qos_policy(qos, lun_id)
-                    self.client.activate_deactivate_qos(policy_id, True)
-            else:
-                policy_id = self.client.create_qos_policy(qos, lun_id)
-                self.client.activate_deactivate_qos(policy_id, True)
+            policy_id = self.client.create_qos_policy(qos, lun_id)
+            self.client.activate_deactivate_qos(policy_id, True)
         except exception.VolumeBackendAPIException:
             with excutils.save_and_reraise_exception():
                 if policy_id is not None:
@@ -183,12 +167,16 @@ class SmartCache(object):
 
 
 class SmartX(object):
+    def __init__(self, client):
+        self.client = client
+
     def get_smartx_specs_opts(self, opts):
         # Check that smarttier is 0/1/2/3
         opts = self.get_smarttier_opts(opts)
         opts = self.get_smartthin_opts(opts)
         opts = self.get_smartcache_opts(opts)
         opts = self.get_smartpartition_opts(opts)
+        opts = self.get_controller_opts(opts)
         return opts
 
     def get_smarttier_opts(self, opts):
@@ -236,5 +224,20 @@ class SmartX(object):
                              'smartpartition:partitionname in key.'))
         else:
             opts['partitionname'] = None
+
+        return opts
+
+    def get_controller_opts(self, opts):
+        if opts['huawei_controller'] == 'true':
+            if not opts['controllername']:
+                raise exception.InvalidInput(
+                    reason=_('Controller name is None, please set '
+                             'controllername:controllername in key.'))
+            else:
+                controller_name = opts['controllername']
+                controller_id = self.client.get_controller_by_name(controller_name)
+                opts['controllerid'] = controller_id
+        else:
+            opts['controllerid'] = None
 
         return opts

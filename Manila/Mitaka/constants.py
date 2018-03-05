@@ -80,13 +80,27 @@ OPTS_CAPABILITIES = {
     'compression': False,
     'huawei_smartcache': False,
     'huawei_smartpartition': False,
+    'huawei_controller': False,
     'thin_provisioning': None,
     'qos': False,
+    'huawei_share_privillage': False,
 }
 
 OPTS_VALUE = {
     'cachename': None,
     'partitionname': None,
+    'controllername': None,
+    'sync': None,
+    'allsquash': None,
+    'rootsquash': None,
+    'secure': None,
+}
+
+OPTS_PRIVILLAGE_VALUE = {
+    'sync': None,
+    'allsquash': None,
+    'rootsquash': None,
+    'secure': None
 }
 
 OPTS_VALUE.update(OPTS_QOS_VALUE)
@@ -95,4 +109,11 @@ OPTS_ASSOCIATE = {
     'huawei_smartcache': 'cachename',
     'huawei_smartpartition': 'partitionname',
     'qos': OPTS_QOS_VALUE,
+    'huawei_controller': 'controllername',
+    'huawei_share_privillage': OPTS_PRIVILLAGE_VALUE,
+}
+
+HUAWEI_UNIFIED_DRIVER_REGISTRY = {
+    'V3': 'manila.share.drivers.huawei.v3.connection.V3StorageConnection',
+    'V5': 'manila.share.drivers.huawei.v3.connection.V3StorageConnection',
 }

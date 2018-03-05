@@ -110,6 +110,7 @@ class SmartX(object):
         opts = self.get_smartprovisioning_opts(opts)
         opts = self.get_smartcache_opts(opts)
         opts = self.get_smartpartition_opts(opts)
+        opts = self.get_controller_opts(opts)
         qos = self.get_qos_opts(opts)
         return opts, qos
 
@@ -145,6 +146,22 @@ class SmartX(object):
                 opts['LUNType'] = constants.ALLOC_TYPE_THIN_FLAG
             else:
                 opts['LUNType'] = constants.ALLOC_TYPE_THICK_FLAG
+
+        return opts
+
+    def get_controller_opts(self, opts):
+        if strutils.bool_from_string(opts['huawei_controller']):
+            if not opts['controllername']:
+                opts['controllerid'] = None
+                raise exception.InvalidInput(
+                    reason=_('Controller name is None, please set '
+                             'huawei_controller:controllername in key.'))
+            else:
+                controller_name = opts['controllername']
+                controller_id = self.helper.get_controller_by_name(controller_name)
+                opts['controllerid'] = controller_id
+        else:
+            opts['controllerid'] = None
 
         return opts
 
