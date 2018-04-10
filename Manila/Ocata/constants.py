@@ -88,7 +88,7 @@ OPTS_CAPABILITIES = {
     'thin_provisioning': None,
     'qos': False,
     'huawei_sectorsize': None,
-    'huawei_share_privillage': False,
+    'huawei_share_privilege': False,
 }
 
 OPTS_VALUE = {
@@ -102,7 +102,7 @@ OPTS_VALUE = {
     'secure': None,
 }
 
-OPTS_PRIVILLAGE_VALUE = {
+OPTS_PRIVILEGE_VALUE = {
     'sync': None,
     'allsquash': None,
     'rootsquash': None,
@@ -118,7 +118,7 @@ OPTS_ASSOCIATE = {
     'huawei_sectorsize': 'sectorsize',
     'qos': OPTS_QOS_VALUE,
     'huawei_controller': 'controllername',
-    'huawei_share_privillage': OPTS_PRIVILLAGE_VALUE,
+    'huawei_share_privilege': OPTS_PRIVILEGE_VALUE,
 }
 
 VALID_SECTOR_SIZES = ('4', '8', '16', '32', '64')

@@ -254,13 +254,6 @@ class V3StorageConnection(driver.HuaweiBase):
             LOG.error(err_msg)
             raise exception.InvalidShare(reason=err_msg)
 
-        if fs_info['ALLOCTYPE'] != constants.ALLOC_TYPE_THIN_FLAG:
-            err_msg = (_("Share (%s) can not be shrunk. only 'Thin' shares "
-                         "support shrink.")
-                       % share_name)
-            LOG.error(err_msg)
-            raise exception.InvalidShare(reason=err_msg)
-
         consumed_size = float(fs_info['MINSIZEFSCAPACITY'])
         if consumed_size > size:
             LOG.error(_LE('%(used).3fGB of share %(id)s is already used. '
@@ -367,7 +360,7 @@ class V3StorageConnection(driver.HuaweiBase):
                     huawei_controller=[True, False],
                     huawei_smartpartition=[True, False],
                     huawei_sectorsize=[True, False],
-                    huawei_share_privillage=[True, False],
+                    huawei_share_privilege=[True, False],
                 )
 
                 if disk_type:
@@ -767,7 +760,7 @@ class V3StorageConnection(driver.HuaweiBase):
 
     def allow_access(self, share, access, share_server=None):
         """Allow access to the share."""
-        share_type_id = share['share_type_id']
+        share_type_id = share.get('share_type_id')
         share_proto = share['share_proto']
         share_name = share['name']
         share_url_type = self.helper._get_share_url_type(share_proto)

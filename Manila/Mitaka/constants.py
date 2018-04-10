@@ -83,7 +83,7 @@ OPTS_CAPABILITIES = {
     'huawei_controller': False,
     'thin_provisioning': None,
     'qos': False,
-    'huawei_share_privillage': False,
+    'huawei_share_privilege': False,
 }
 
 OPTS_VALUE = {
@@ -96,7 +96,7 @@ OPTS_VALUE = {
     'secure': None,
 }
 
-OPTS_PRIVILLAGE_VALUE = {
+OPTS_PRIVILEGE_VALUE = {
     'sync': None,
     'allsquash': None,
     'rootsquash': None,
@@ -110,7 +110,7 @@ OPTS_ASSOCIATE = {
     'huawei_smartpartition': 'partitionname',
     'qos': OPTS_QOS_VALUE,
     'huawei_controller': 'controllername',
-    'huawei_share_privillage': OPTS_PRIVILLAGE_VALUE,
+    'huawei_share_privilege': OPTS_PRIVILEGE_VALUE,
 }
 
 HUAWEI_UNIFIED_DRIVER_REGISTRY = {

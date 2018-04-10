@@ -171,13 +171,6 @@ class V3StorageConnection(driver.HuaweiBase):
             LOG.error(err_msg)
             raise exception.InvalidShare(reason=err_msg)
 
-        if fs_info['ALLOCTYPE'] != '1':
-            err_msg = (_("Share (%s) can not be shrunk. only 'Thin' shares "
-                         "support shrink.")
-                       % share_name)
-            LOG.error(err_msg)
-            raise exception.InvalidShare(reason=err_msg)
-
         self.helper._change_share_size(fsid, size)
 
     def check_fs_status(self, health_status, running_status):
