@@ -20,7 +20,7 @@ from oslo_log import log as logging
 from oslo_utils import excutils
 
 from cinder import exception
-from cinder.i18n import _, _LW, _LE, _LI
+from cinder.i18n import _, _LI, _LE, _LW
 from cinder.volume.drivers.huawei import constants
 from cinder.volume.drivers.huawei import huawei_utils
 
@@ -822,7 +822,7 @@ class ReplicaPairManager(object):
         if lun_id and self.rmt_client.check_lun_exist(lun_id):
             self.rmt_client.delete_lun(lun_id)
 
-    def delete_replica(self, volume):
+    def delete_replica(self, volume, replication_driver_data=None):
         """Delete replication pair and remote lun.
 
         Purpose:
@@ -830,7 +830,11 @@ class ReplicaPairManager(object):
             2. delete remote_lun
         """
         LOG.debug('Delete replication, volume: %s.', volume.id)
-        info = get_replication_driver_data(volume)
+        if replication_driver_data:
+            info = json.loads(replication_driver_data)
+        else:
+            info = get_replication_driver_data(volume)
+
         pair_id = info.get('pair_id')
         if pair_id:
             self._delete_pair(pair_id)

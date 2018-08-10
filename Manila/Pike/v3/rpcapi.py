@@ -36,19 +36,21 @@ class HuaweiV3API(object):
                                   version=self.BASE_RPC_API_VERSION)
         self.client = rpc.get_client(target, version_cap='1.1')
 
-    def create_replica_pair(self, context, host, local_share_info,
-                            remote_device_wwn, remote_fs_id):
+    def create_replica_pair(
+            self, context, host, local_share_info, remote_device_wwn,
+            remote_fs_id, local_replication):
         new_host = utils.extract_host(host)
         call_context = self.client.prepare(server=new_host, version='1.0')
         return call_context.call(
             context, 'create_replica_pair',
             local_share_info=local_share_info,
             remote_device_wwn=remote_device_wwn,
-            remote_fs_id=remote_fs_id)
+            remote_fs_id=remote_fs_id,
+            local_replication=local_replication,
+        )
 
     def clear_share_access(self, context, host, share):
         new_host = utils.extract_host(host)
         call_context = self.client.prepare(server=new_host, version='1.1')
-        return call_context.call(context,
-                                 'clear_share_access',
-                                 share=share)
+        return call_context.call(
+            context, 'clear_share_access', share=share)

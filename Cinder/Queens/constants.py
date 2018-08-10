@@ -145,3 +145,11 @@ REPLICG_STATUS_INVALID = '35'
 REPLICG_HEALTH_NORMAL = '1'
 
 OPTIMAL_MULTIPATH_NUM = 16
+
+AVAILABLE_FEATURE_STATUS = (1, 2)
+DEDUP_FEATURES = ('SmartDedupe (for LUN)',
+                  'SmartDedupe (for LUNsAndFS)',
+                  'SmartDedupe & SmartCompression (for LUN)')
+COMPRESSION_FEATURES = ('SmartCompression (for LUN)',
+                        'SmartCompression (for LUNsAndFS)',
+                        'SmartDedupe & SmartCompression (for LUN)')

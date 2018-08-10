@@ -1836,16 +1836,14 @@ class V3StorageConnection(driver.HuaweiBase):
                           replica['id'])
             raise
 
-        updated_new_active_access = True
-        cleared_old_active_access = True
-
+        new_access_status = common_constants.STATUS_ACTIVE
         try:
             self.update_access(replica, access_rules, [], [], share_server)
         except Exception:
             LOG.warning(_LW('Failed to set access rules to '
                             'new active replica %s.'),
                         replica['id'])
-            updated_new_active_access = False
+            new_access_status = common_constants.SHARE_INSTANCE_RULES_ERROR
 
         old_active_replica = share_utils.get_active_replica(replica_list)
 
@@ -1857,28 +1855,21 @@ class V3StorageConnection(driver.HuaweiBase):
             LOG.warning(_LW("Failed to clear access rules from "
                             "old active replica %s."),
                         old_active_replica['id'])
-            cleared_old_active_access = False
 
         new_active_update = {
             'id': replica['id'],
             'replica_state': common_constants.REPLICA_STATE_ACTIVE,
+            'access_rules_status': new_access_status,
         }
-        new_active_update['access_rules_status'] = (
-            common_constants.STATUS_ACTIVE if updated_new_active_access
-            else common_constants.STATUS_OUT_OF_SYNC)
 
         # get replica state for new secondary after switch over
         replica_state = self.replica_mgr.get_replica_state(replica_pair_id)
-
         old_active_update = {
             'id': old_active_replica['id'],
             'replica_state': replica_state,
         }
-        old_active_update['access_rules_status'] = (
-            common_constants.STATUS_OUT_OF_SYNC if cleared_old_active_access
-            else common_constants.STATUS_ACTIVE)
 
-        return [new_active_update, old_active_update]
+        return [old_active_update, new_active_update]
 
     def delete_replica(self, context, replica_list, replica_snapshots,
                        replica, share_server=None):

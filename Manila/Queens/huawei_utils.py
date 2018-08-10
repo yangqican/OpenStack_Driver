@@ -14,6 +14,7 @@
 #    under the License.
 
 import copy
+import retrying
 
 from oslo_log import log
 
@@ -76,3 +77,17 @@ def _get_opts_from_specs(specs):
                     (key in constants.OPTS_ASSOCIATE[scope])):
                 opts[key] = value
     return opts
+
+
+def wait_for_condition(func, interval, timeout):
+    def _retry_on_result(result):
+        return not result
+
+    def _retry_on_exception(result):
+        return False
+
+    r = retrying.Retrying(retry_on_result=_retry_on_result,
+                          retry_on_exception=_retry_on_exception,
+                          wait_fixed=interval * 1000,
+                          stop_max_delay=timeout * 1000)
+    r.call(func)

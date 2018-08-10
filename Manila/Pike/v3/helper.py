@@ -692,6 +692,7 @@ class RestHelper(object):
         self._assert_data_in_result(result, msg)
 
         fs = {}
+        fs['ID'] = result['data']['ID']
         fs['HEALTHSTATUS'] = result['data']['HEALTHSTATUS']
         fs['RUNNINGSTATUS'] = result['data']['RUNNINGSTATUS']
         fs['CAPACITY'] = result['data']['CAPACITY']
@@ -702,6 +703,8 @@ class RestHelper(object):
         fs['DEDUP'] = result['data']['ENABLEDEDUP']
         fs['SMARTPARTITIONID'] = result['data']['CACHEPARTITIONID']
         fs['SMARTCACHEID'] = result['data']['SMARTCACHEPARTITIONID']
+        fs['REMOTEREPLICATIONIDS'] = result['data']['REMOTEREPLICATIONIDS']
+        fs['ISCLONEFS'] = result['data']['ISCLONEFS']
         return fs
 
     def _get_share_path(self, share_name):
@@ -1346,12 +1349,7 @@ class RestHelper(object):
         data = jsonutils.dumps(pair_params)
         result = self.call(url, data, "POST")
 
-        msg = _('Failed to create replication pair for '
-                '(LOCALRESID: %(lres)s, REMOTEDEVICEID: %(rdev)s, '
-                'REMOTERESID: %(rres)s).') % {
-                    'lres': pair_params['LOCALRESID'],
-                    'rdev': pair_params['REMOTEDEVICEID'],
-                    'rres': pair_params['REMOTERESID']}
+        msg = _('Failed to create replication pair of %s.') % pair_params
         self._assert_rest_result(result, msg)
         self._assert_data_in_result(result, msg)
         return result['data']
@@ -1451,3 +1449,15 @@ class RestHelper(object):
         result = self.call(url, None, "GET")
         self._assert_rest_result(result, _('Get all controller error.'))
         return result.get('data', [])
+
+    def split_clone_fs(self, fs_id):
+        data = jsonutils.dumps(
+            {"ID": fs_id,
+             "SPLITENABLE": True,
+             "SPLITSPEED": 4,
+             }
+        )
+        result = self.call("/filesystem_split_switch", data, "PUT")
+
+        msg = _('Split clone fs %s error.') % fs_id
+        self._assert_rest_result(result, msg)

@@ -13,6 +13,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import json
+
 from oslo_log import log
 from oslo_utils import strutils
 
@@ -29,7 +31,8 @@ class ReplicaPairManager(object):
     def __init__(self, helper):
         self.helper = helper
 
-    def create(self, local_share_info, remote_device_wwn, remote_fs_id):
+    def create(self, local_share_info, remote_device_wwn, remote_fs_id,
+               local_replication):
         local_share_name = local_share_info.get('name')
 
         try:
@@ -40,13 +43,9 @@ class ReplicaPairManager(object):
                 raise exception.ReplicationException(
                     reason=msg % local_share_name)
 
-            remote_device = self.helper.get_remote_device_by_wwn(
-                remote_device_wwn)
             pair_params = {
                 "LOCALRESID": local_fs_id,
                 "LOCALRESTYPE": constants.FILE_SYSTEM_TYPE,
-                "REMOTEDEVICEID": remote_device.get('ID'),
-                "REMOTEDEVICENAME": remote_device.get('NAME'),
                 "REMOTERESID": remote_fs_id,
                 "REPLICATIONMODEL": constants.REPLICA_ASYNC_MODEL,
                 "RECOVERYPOLICY": '2',
@@ -54,15 +53,32 @@ class ReplicaPairManager(object):
                 "SPEED": constants.REPLICA_SPEED_MEDIUM,
             }
 
+            if local_replication:
+                pair_params["PAIRTYPE"] = constants.LOCAL_REPLICATION
+            else:
+                remote_device = self.helper.get_remote_device_by_wwn(
+                    remote_device_wwn)
+                pair_params["REMOTEDEVICEID"] = remote_device.get('ID')
+
             pair_info = self.helper.create_replication_pair(pair_params)
+            local_pair_id = pair_info['ID']
+
+            if local_replication:
+                remote_fs = self.helper._get_fs_info_by_id(remote_fs_id)
+                replication_ids = json.loads(remote_fs['REMOTEREPLICATIONIDS'])
+                # Here must have a replication id.
+                remote_pair_id = replication_ids[0]
+            else:
+                remote_pair_id = local_pair_id
+
         except Exception:
-            msg = "Failed to create replication pair for share %s."
-            LOG.exception(msg, local_share_name)
+            LOG.exception("Failed to create replication pair for share %s.",
+                          local_share_name)
             raise
 
-        self._sync_replication_pair(pair_info['ID'])
+        self._sync_replication_pair(local_pair_id)
 
-        return pair_info['ID']
+        return local_pair_id, remote_pair_id
 
     def _get_replication_pair_info(self, replica_pair_id):
         try:

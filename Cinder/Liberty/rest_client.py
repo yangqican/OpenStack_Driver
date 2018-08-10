@@ -50,6 +50,7 @@ class RestClient(object):
         self.san_address = san_address
         self.san_user = san_user
         self.san_password = san_password
+        self.vstore_name = kwargs.get('vstore_name', None)
         self.storage_pools = kwargs.get('storage_pools',
                                         self.configuration.storage_pools)
         self.iscsi_info = kwargs.get('iscsi_info',
@@ -134,10 +135,10 @@ class RestClient(object):
 
         res_json = res.json()
         if not filter_flag:
-            LOG.info(_LI('\n\n\n\nRequest URL: %(url)s\n\n'
-                         'Call Method: %(method)s\n\n'
-                         'Request Data: %(data)s\n\n'
-                         'Response Data:%(res)s\n\n'),
+            LOG.info(_LI('\nRequest URL: %(url)s\n'
+                         'Call Method: %(method)s\n'
+                         'Request Data: %(data)s\n'
+                         'Response Data:%(res)s'),
                      {'url': url,
                       'method': method,
                       'data': data,
@@ -153,6 +154,8 @@ class RestClient(object):
             data = {"username": self.san_user,
                     "password": self.san_password,
                     "scope": "0"}
+            if self.vstore_name:
+                data['vstorename'] = self.vstore_name
             self.init_http_head()
             self.session.mount(item_url.lower(), HostNameIgnoringAdapter())
             result = self.do_call(url, data,
@@ -457,26 +460,15 @@ class RestClient(object):
 
         return self._get_id_from_result(result, name, 'NAME')
 
-    def create_luncopy(self, luncopyname, srclunid, tgtlunid, copyspeed):
-        """Create a luncopy."""
-        url = "/luncopy"
-        if copyspeed not in constants.LUN_COPY_SPEED_TYPES:
-            LOG.warning(_LW('The copy speed %(copyspeed)s is not valid, '
-                            'use default value %(default)s instead.'),
-                        {'copyspeed': copyspeed,
-                         'default': constants.LUN_COPY_SPEED_MEDIUM})
-            copyspeed = constants.LUN_COPY_SPEED_MEDIUM
-
-        data = {"TYPE": 219,
-                "NAME": luncopyname,
-                "DESCRIPTION": luncopyname,
+    def create_luncopy(self, srclunid, tgtlunid, copyspeed):
+        data = {"NAME": 'LUNCopy_%s_%s' % (srclunid, tgtlunid),
                 "COPYSPEED": copyspeed,
-                "LUNCOPYTYPE": "1",
                 "SOURCELUN": ("INVALID;%s;INVALID;INVALID;INVALID"
                               % srclunid),
                 "TARGETLUN": ("INVALID;%s;INVALID;INVALID;INVALID"
-                              % tgtlunid)}
-        result = self.call(url, data)
+                              % tgtlunid),
+                }
+        result = self.call("/luncopy", data)
 
         msg = _('Create luncopy error.')
         self._assert_rest_result(result, msg)
@@ -1838,6 +1830,11 @@ class RestClient(object):
 
         return initiators
 
+    def update_lun(self, lun_id, data):
+        url = "/lun/" + lun_id
+        result = self.call(url, data, "PUT")
+        self._assert_rest_result(result, _('Update lun properties error.'))
+
     def rename_lun(self, lun_id, new_name, description=None):
         url = "/lun/" + lun_id
         data = {"NAME": new_name}
@@ -2012,40 +2009,12 @@ class RestClient(object):
         self._assert_rest_result(result, msg)
 
     def get_hypermetro_by_id(self, metro_id):
-        url = "/HyperMetroPair/" + metro_id
+        url = "/HyperMetroPair?filter=ID::%s" % metro_id
         result = self.call(url, None, "GET")
-
         msg = _('get_hypermetro_by_id error.')
         self._assert_rest_result(result, msg)
-        self._assert_data_in_result(result, msg)
-        return result['data']
-
-    def check_hypermetro_exist(self, metro_id):
-        url = "/HyperMetroPair/" + metro_id
-        result = self.call(url, None, "GET")
-        error_code = result['error']['code']
-
-        if (error_code == constants.ERROR_CONNECT_TO_SERVER
-                or error_code == constants.ERROR_UNAUTHORIZED_TO_SERVER):
-            LOG.error(_LE("Can not open the recent url, login again."))
-            self.login()
-            result = self.call(url, None, "GET")
-
-        error_code = result['error']['code']
-        if (error_code == constants.ERROR_CONNECT_TO_SERVER
-                or error_code == constants.ERROR_UNAUTHORIZED_TO_SERVER):
-            msg = _("check_hypermetro_exist error.")
-            LOG.error(msg)
-            raise exception.VolumeBackendAPIException(data=msg)
-
-        if error_code != 0:
-            if error_code == constants.HYPERMETROPAIR_NOT_EXIST:
-                return False
-            msg = (_("check_hypermetro_exist error.\nresult: %(res)s.")
-                   % {'res': result})
-            LOG.error(msg)
-            raise exception.VolumeBackendAPIException(data=msg)
-        return True
+        if result.get('data'):
+            return result['data'][0]
 
     def change_hostlun_id(self, map_info, hostlun_id):
         url = "/mappingview"
@@ -2544,3 +2513,40 @@ class RestClient(object):
         result = self.call(url, None, "GET")
         self._assert_rest_result(result, _('Get all controller error.'))
         return result.get('data', [])
+
+    def get_license_feature_status(self):
+        url = "/license/feature"
+        result = self.call(url, None, "GET", filter_flag=True)
+        if result['error']['code'] != 0:
+            msg = (_("Query license status of features failed.\nresult: %(res)s.")
+                   % {'res': result})
+            LOG.error(msg)
+            return {}
+        dic_result = {}
+        for i in result.get('data', []):
+            for key, value in i.items():
+                dic_result[key] = value
+
+        return dic_result
+
+    def create_clone_lun(self, src_id, lun_name):
+        data = {
+            "CLONESOURCEID": src_id,
+            "ISCLONE": True,
+            "NAME": lun_name,
+        }
+
+        result = self.call('/lun', data, "POST")
+        self._assert_rest_result(result, _('Create clone lun error.'))
+        return result['data']
+
+    def split_clone_lun(self, clone_id):
+        data = {
+            "ID": clone_id,
+            "SPLITACTION": 1,
+            "ISCLONE": True,
+            "SPLITSPEED": 4,
+        }
+
+        result = self.call('/lunclone_split_switch', data, "PUT")
+        self._assert_rest_result(result, _('Split clone lun error.'))

@@ -29,7 +29,11 @@ from manila.share.drivers.huawei import constants
 huawei_opts = [
     cfg.StrOpt('manila_huawei_conf_file',
                default='/etc/manila/manila_huawei_conf.xml',
-               help='The configuration file for the Manila Huawei driver.')]
+               help='The configuration file for the Manila Huawei driver.'),
+    cfg.BoolOpt('local_replication',
+               default=False,
+               help='The replication type of backend Huawei storage.'),
+]
 
 CONF = cfg.CONF
 CONF.register_opts(huawei_opts)

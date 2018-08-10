@@ -44,6 +44,7 @@ class HuaweiConf(object):
         xml_root = tree.getroot()
         name_node = xml_root.find('Storage/UserName')
         pwd_node = xml_root.find('Storage/UserPassword')
+        vstore_node = xml_root.find('Storage/vStoreName')
         if (name_node is not None
                 and not name_node.text.startswith('!$$$')):
             name_node.text = '!$$$' + base64.b64encode(name_node.text)
@@ -51,6 +52,10 @@ class HuaweiConf(object):
         if (pwd_node is not None
                 and not pwd_node.text.startswith('!$$$')):
             pwd_node.text = '!$$$' + base64.b64encode(pwd_node.text)
+            need_encode = True
+        if (vstore_node is not None
+                and not vstore_node.text.startswith('!$$$')):
+            vstore_node.text = '!$$$' + base64.b64encode(vstore_node.text)
             need_encode = True
 
         if need_encode:
@@ -66,6 +71,7 @@ class HuaweiConf(object):
         set_attr_funcs = (self._san_address,
                           self._san_user,
                           self._san_password,
+                          self._vstore_name,
                           self._san_product,
                           self._san_protocol,
                           self._lun_type,
@@ -136,6 +142,14 @@ class HuaweiConf(object):
 
         pwd = base64.b64decode(text[4:])
         setattr(self.conf, 'san_password', pwd)
+
+    def _vstore_name(self, xml_root):
+        text = xml_root.findtext('Storage/vStoreName')
+        if text:
+            vstore_name = base64.b64decode(text[4:])
+            setattr(self.conf, 'vstore_name', vstore_name)
+        else:
+            setattr(self.conf, 'vstore_name', None)
 
     def _set_extra_constants_by_product(self, product):
         extra_constants = {}
@@ -397,6 +411,7 @@ class HuaweiConf(object):
             dev_config['san_address'] = dev['san_address'].split(';')
             dev_config['san_user'] = dev['san_user']
             dev_config['san_password'] = dev['san_password']
+            dev_config['vstore_name'] = dev.get('vstore_name')
             dev_config['metro_domain'] = dev['metro_domain']
             dev_config['storage_pools'] = dev['storage_pool'].split(';')
             dev_config['iscsi_info'] = self._parse_rmt_iscsi_info(
@@ -423,6 +438,7 @@ class HuaweiConf(object):
             dev_config['san_address'] = dev['san_address'].split(';')
             dev_config['san_user'] = dev['san_user']
             dev_config['san_password'] = dev['san_password']
+            dev_config['vstore_name'] = dev.get('vstore_name')
             dev_config['storage_pools'] = dev['storage_pool'].split(';')
             dev_config['iscsi_info'] = self._parse_rmt_iscsi_info(
                 dev.get('iscsi_info'))
@@ -442,6 +458,7 @@ class HuaweiConf(object):
             'san_address': self.conf.san_address,
             'san_user': self.conf.san_user,
             'san_password': self.conf.san_password,
+            'vstore_name': self.conf.vstore_name,
             'storage_pools': self.conf.storage_pools,
             'iscsi_info': self.conf.iscsi_info,
             'fc_info': self.conf.fc_info,

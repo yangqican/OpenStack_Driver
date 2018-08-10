@@ -96,13 +96,11 @@ def get_volume_size(volume):
 
 
 def get_volume_metadata(volume):
-    if type(volume) is objects.Volume:
+    if isinstance(volume, objects.Volume):
         return volume.metadata
-
-    if 'volume_metadata' in volume:
-        metadata = volume.get('volume_metadata')
-        return {item['key']: item['value'] for item in metadata}
-
+    if volume.get('volume_metadata'):
+        return {item['key']: item['value'] for item in
+                volume['volume_metadata']}
     return {}
 
 
@@ -218,3 +216,11 @@ def get_host_id(client, host_name):
         host_id = client.get_host_id_by_name(encoded_name)
 
     return host_id
+
+
+def check_feature_available(feature_status, features):
+    for f in features:
+        if feature_status.get(f) in constants.AVAILABLE_FEATURE_STATUS:
+            return True
+
+    return False

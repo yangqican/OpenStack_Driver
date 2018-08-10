@@ -31,14 +31,13 @@ class HuaweiV3Manager(object):
         self.connection = connection
         self.replica_mgr = replica_mgr
 
-    def create_replica_pair(self, ctx,
-                            local_share_info,
-                            remote_device_wwn,
-                            remote_fs_id):
+    def create_replica_pair(
+            self, ctx, local_share_info, remote_device_wwn, remote_fs_id,
+            local_replication):
         """Create replication pair."""
-        return self.replica_mgr.create(local_share_info,
-                                       remote_device_wwn,
-                                       remote_fs_id)
+        return self.replica_mgr.create(
+            local_share_info, remote_device_wwn, remote_fs_id,
+            local_replication)
 
     def clear_share_access(self, ctx, share):
         """Clear share access."""

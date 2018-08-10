@@ -83,7 +83,7 @@ class HuaweiHyperMetro(object):
         remote_lun_id = metadata.get('remote_lun_id')
 
         # Delete hypermetro.
-        if metro_id and self.client.check_hypermetro_exist(metro_id):
+        if metro_id and self.client.get_hypermetro_by_id(metro_id):
             self.check_metro_need_to_stop(metro_id)
             self.client.delete_hypermetro(metro_id)
 
@@ -273,7 +273,7 @@ class HuaweiHyperMetro(object):
             for volume in volumes:
                 metadata = huawei_utils.get_lun_metadata(volume)
                 metro_id = metadata.get('hypermetro_id')
-                if metro_id and self.client.check_hypermetro_exist(metro_id):
+                if metro_id and self.client.get_hypermetro_by_id(metro_id):
                     if self._check_metro_in_cg(metro_id, metrogroup_id):
                         self.client.remove_metro_from_metrogroup(metrogroup_id,
                                                                  metro_id)
@@ -314,7 +314,7 @@ class HuaweiHyperMetro(object):
             for volume in add_volumes:
                 metadata = huawei_utils.get_lun_metadata(volume)
                 metro_id = metadata.get('hypermetro_id')
-                if metro_id and self.client.check_hypermetro_exist(metro_id):
+                if metro_id and self.client.get_hypermetro_by_id(metro_id):
                     if not self._check_metro_in_cg(metro_id, metrogroup_id):
                         self.check_metro_need_to_stop(metro_id)
                         self.client.add_metro_to_metrogroup(metrogroup_id,
@@ -330,7 +330,7 @@ class HuaweiHyperMetro(object):
             for volume in remove_volumes:
                 metadata = huawei_utils.get_lun_metadata(volume)
                 metro_id = metadata.get('hypermetro_id')
-                if metro_id and self.client.check_hypermetro_exist(metro_id):
+                if metro_id and self.client.get_hypermetro_by_id(metro_id):
                     if self._check_metro_in_cg(metro_id, metrogroup_id):
                         self.check_metro_need_to_stop(metro_id)
                         self.client.remove_metro_from_metrogroup(metrogroup_id,
@@ -371,13 +371,14 @@ class HuaweiHyperMetro(object):
 
     def check_metro_need_to_stop(self, metro_id):
         metro_info = self.client.get_hypermetro_by_id(metro_id)
-        metro_health_status = metro_info['HEALTHSTATUS']
-        metro_running_status = metro_info['RUNNINGSTATUS']
+        if metro_info:
+            metro_health_status = metro_info['HEALTHSTATUS']
+            metro_running_status = metro_info['RUNNINGSTATUS']
 
-        if (metro_health_status == constants.HEALTH_NORMAL and
-            (metro_running_status == constants.RUNNING_NORMAL or
-                metro_running_status == constants.RUNNING_SYNC)):
-            self.client.stop_hypermetro(metro_id)
+            if (metro_health_status == constants.HEALTH_NORMAL and
+                (metro_running_status == constants.RUNNING_NORMAL or
+                    metro_running_status == constants.RUNNING_SYNC)):
+                self.client.stop_hypermetro(metro_id)
 
     def _get_metro_group_id(self, id):
         group_name = huawei_utils.encode_name(id)
@@ -408,9 +409,7 @@ class HuaweiHyperMetro(object):
 
     def _check_metro_in_cg(self, metro_id, cg_id):
         metro_info = self.client.get_hypermetro_by_id(metro_id)
-        if metro_info['ISINCG'] == 'true' and metro_info['CGID'] == cg_id:
-            return True
-        return False
+        return metro_info and metro_info['ISINCG'] == 'true' and metro_info['CGID'] == cg_id
 
     def _valid_rmt_metro_domain(self):
         domain_name = self.rmt_client.metro_domain

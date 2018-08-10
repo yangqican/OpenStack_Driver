@@ -821,7 +821,7 @@ class ReplicaPairManager(object):
         if lun_id and self.rmt_client.check_lun_exist(lun_id):
             self.rmt_client.delete_lun(lun_id)
 
-    def delete_replica(self, volume):
+    def delete_replica(self, volume, replication_driver_data=None):
         """Delete replication pair and remote lun.
 
         Purpose:
@@ -829,7 +829,11 @@ class ReplicaPairManager(object):
             2. delete remote_lun
         """
         LOG.debug('Delete replication, volume: %s.', volume.id)
-        info = get_replication_driver_data(volume)
+        if replication_driver_data:
+            info = json.loads(replication_driver_data)
+        else:
+            info = get_replication_driver_data(volume)
+
         pair_id = info.get('pair_id')
         if pair_id:
             self._delete_pair(pair_id)
